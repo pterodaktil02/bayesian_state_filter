@@ -1,0 +1,19 @@
+sensor:
+  - platform: bayesian_state_filter
+    name: "Room temperature"
+    ensemble:
+      sources:
+        - sensor.temperature_1
+        - sensor.temperature_2
+        - sensor.temperature_3
+        - sensor.temperature_4
+      min_sources: 2
+
+    bayes:
+      noise_model: auto
+      history_days: 7
+      save_every_s: 60
+      tau_points: 16
+      characteristic_refit_s: 1800
+      student_nu: 4
+      diagnostics: compact

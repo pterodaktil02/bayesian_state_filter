@@ -1,0 +1,45 @@
+sensor:
+  - platform: bayesian_state_filter
+    name: "Room temperature"
+
+    ensemble:
+      sources:
+        - sensor.temperature_1
+        - sensor.temperature_2
+        - sensor.temperature_3
+        - sensor.temperature_4
+      min_sources: 2
+
+    bayes:
+      # auto | gaussian | poisson
+      noise_model: auto
+
+      # Recorder history used at startup.
+      history_days: 7
+
+      # Persistence interval.
+      save_every_s: 60
+
+      # Number of points in the internal predictive tau grid.
+      tau_points: 16
+
+      # Optional bounds for predictive velocity memory tau.
+      # tau_min_s: 60
+      # tau_max_s: 86400
+
+      # Optional bounds for level-process characteristic time.
+      # characteristic_tau_min_s: 300
+      # characteristic_tau_max_s: 172800
+
+      # How often the rolling characteristic-time estimate may be refitted.
+      characteristic_refit_s: 1800
+
+      # Optional forgetting time for the predictive dynamics bank.
+      # Omit for automatic selection.
+      # forget_time_s: 259200
+
+      # Degrees of freedom of the Student-t robust updater.
+      student_nu: 4
+
+      # compact | full
+      diagnostics: compact

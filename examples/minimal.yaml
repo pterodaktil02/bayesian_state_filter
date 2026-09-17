@@ -1,0 +1,8 @@
+sensor:
+  - platform: bayesian_state_filter
+    name: "Room temperature"
+    ensemble:
+      sources:
+        - sensor.temperature_1
+        - sensor.temperature_2
+        - sensor.temperature_3

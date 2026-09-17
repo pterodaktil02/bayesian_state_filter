@@ -1,0 +1,17 @@
+sensor:
+  - platform: bayesian_state_filter
+    name: "Radiation rate"
+    ensemble:
+      sources:
+        - sensor.counter_rate_1
+        - sensor.counter_rate_2
+      min_sources: 1
+
+    bayes:
+      # Explicit Poisson-family observation variance.
+      # In 0.2.1.6 automatic Poisson detection is not implemented yet;
+      # noise_model: auto still selects Gaussian.
+      noise_model: poisson
+      history_days: 7
+      student_nu: 4
+      diagnostics: compact
