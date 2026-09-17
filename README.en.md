@@ -4,6 +4,8 @@ Version: **0.2.1.6**
 
 [Русский README](README.md)
 
+> **Do not confuse this project with Home Assistant's built-in [`bayesian`](https://www.home-assistant.io/integrations/bayesian/) integration.** The built-in integration estimates the probability of an event from a set of observations and exposes a **binary** `on/off` sensor. Even when numeric observations are used, its result is still a `binary_sensor`. `bayesian_state_filter` is specifically intended for **numeric sensors and continuous-valued quantities**: it fuses asynchronous measurements of the same physical quantity and produces a continuous numeric estimate, for example temperature, humidity or pressure.
+
 `bayesian_state_filter` is a Home Assistant custom sensor platform that fuses multiple asynchronous numeric sensors into one robust Bayesian estimate of a shared latent state.
 
 It learns relative source bias, effective observation uncertainty, source cadence, predictive local dynamics and a separate level-process characteristic time. Live updates use an always-on Student-t robust updater, so a temporarily divergent sensor is downweighted rather than blindly averaged into the result.
@@ -228,8 +230,7 @@ At startup the integration:
 3. estimates relative source bias;
 4. obtains a preliminary level-process time scale;
 5. calibrates per-source uncertainty from close-in-time sensor pairs;
-6. solves non-negative source variances from
-   `Var(i-j) ~= sigma_i^2 + sigma_j^2`;
+6. solves non-negative source variances from `Var(i-j) ~= sigma_i^2 + sigma_j^2`;
 7. rebuilds fused history with calibrated source variances;
 8. estimates final level-process characteristic time;
 9. trains the predictive damped-velocity model;
@@ -294,6 +295,8 @@ Last-update fields are internally consistent and all refer to the same observati
 - `z_score`
 - `robust_weight`
 - `update_dt_s`
+
+`z_score` is the absolute innovation divided by its expected standard deviation, including both predicted state uncertainty and measurement variance. It is therefore a normalized innovation of the observation model, not simply "sensor error in sigmas".
 
 # `source_health`
 
@@ -382,3 +385,14 @@ pytest -q
 ```
 
 The test suite covers robust outlier handling, posterior uncertainty, bias calibration, pairwise source variance calibration, recovery of known synthetic source sigmas, history order invariance, live time-ordering/backdating policy, startup repeatability, correlated fast-source noise and synthetic OU characteristic-time estimation.
+
+# Authors and license
+
+Authors:
+
+- **E. V. Polupanov** (`Е. В. Полупанов`)
+- **G. P. Timofeev** (`Г. П. Тимофеев`)
+
+See also [`AUTHORS.md`](AUTHORS.md).
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0-only)**. See [`LICENSE`](LICENSE) for the full text.
