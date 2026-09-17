@@ -98,8 +98,10 @@ def _fit_nonnegative_line(f: np.ndarray, y: np.ndarray, w: np.ndarray) -> tuple[
         if nugget >= 0.0 and sill >= 0.0:
             candidates.append((nugget, sill))
 
+    # Boundary nugget=0.
     if s11 > 1e-30:
         candidates.append((0.0, max(0.0, b1 / s11)))
+    # Boundary sill=0.
     if s00 > 1e-30:
         candidates.append((max(0.0, b0 / s00), 0.0))
     if not candidates:
@@ -115,7 +117,11 @@ def _fit_nonnegative_line(f: np.ndarray, y: np.ndarray, w: np.ndarray) -> tuple[
 
 def _lag_rows(points: list[tuple[float, float, float]], *, lag_points: int = 26,
               max_pairs_per_lag: int = 4096) -> list[tuple[float, float, float, float, int]]:
-    """Return (lag, gamma, gamma_se, measurement_floor, pairs) rows."""
+    """Return (lag, gamma, gamma_se, measurement_floor, pairs) rows.
+
+    Points are normally produced on a regular fusion grid, but nearest-time
+    matching keeps this tolerant of occasional holes in that grid.
+    """
     if len(points) < 40:
         return []
     arr = np.asarray(points, dtype=float)
@@ -131,6 +137,8 @@ def _lag_rows(points: list[tuple[float, float, float]], *, lag_points: int = 26,
 
     max_lag = max(2.0 * step, span / 3.0)
     raw_lags = np.geomspace(step, max_lag, max(int(lag_points), 10))
+    # Quantise requested lags to the underlying time grid so the shortest
+    # geometric bins do not collapse to duplicate 1-step comparisons.
     lag_steps = np.unique(np.maximum(1, np.rint(raw_lags / step).astype(int)))
     requested = lag_steps.astype(float) * step
 
@@ -154,11 +162,16 @@ def _lag_rows(points: list[tuple[float, float, float]], *, lag_points: int = 26,
         if ii.size < 30:
             continue
 
+        # Deterministic thinning bounds startup CPU while preserving coverage
+        # across the whole history instead of taking only the newest pairs.
         if ii.size > max_pairs_per_lag:
             sel = np.linspace(0, ii.size - 1, max_pairs_per_lag).astype(int)
             ii, jj = ii[sel], jj[sel]
 
         diff = values[jj] - values[ii]
+        # Chunk-by-time estimates provide an empirical uncertainty that also
+        # penalises non-stationarity; a 7-day trend should not yield fake
+        # precision just because there are many samples.
         chunks_n = min(10, max(3, diff.size // 150))
         chunk_indices = np.array_split(np.arange(diff.size), chunks_n)
         chunk_gamma = []
@@ -174,15 +187,19 @@ def _lag_rows(points: list[tuple[float, float, float]], *, lag_points: int = 26,
             gamma_se = mad / math.sqrt(float(cg.size))
         else:
             gamma_se = 0.10 * max(gamma, 1e-15)
+        # Do not let huge pair counts claim absurd precision for a model that
+        # is only an approximation to real environmental dynamics.
         gamma_se = max(gamma_se, 0.07 * max(gamma, 1e-15), 1e-15)
 
         measurement_floor = float(np.median(0.5 * (variances[ii] + variances[jj])))
         realised_lag = float(np.median(times[jj] - times[ii]))
         rows.append((realised_lag, gamma, gamma_se, measurement_floor, int(ii.size)))
 
+    # Merge any accidental duplicate realised lags after nearest-time matching.
     merged = []
     for row in rows:
         if merged and abs(row[0] - merged[-1][0]) <= max(step * 0.05, 1e-6):
+            # Keep the row with more pairs (normally identical).
             if row[4] > merged[-1][4]:
                 merged[-1] = row
         else:
@@ -194,7 +211,13 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
                                  tau_points: int = 48,
                                  tau_min_s: float | None = None,
                                  tau_max_s: float | None = None) -> CharacteristicTimeEstimate | None:
-    """Estimate the characteristic time of the latent *level* process."""
+    """Estimate the characteristic time of the latent *level* process.
+
+    A profile fit over tau is used; nugget and process variance are solved by
+    non-negative weighted least squares for each tau.  Confidence is reduced
+    when the process signal is weak, the posterior is boundary-censored, or
+    the history does not extend far enough beyond the fitted knee.
+    """
     rows = _lag_rows(points)
     if len(rows) < 6:
         return None
@@ -202,6 +225,9 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
     arr = np.asarray(rows, dtype=float)
     h, gamma, se, noise_floor, pair_counts = arr.T
     hmin, hmax = float(np.min(h)), float(np.max(h))
+    # Search deliberately extends below the first measured lag and beyond the
+    # largest lag.  If evidence accumulates there the result is marked as a
+    # bound rather than pretending that the boundary value was measured.
     tmin = max(float(tau_min_s), 1e-3) if tau_min_s is not None else max(hmin / 4.0, 1e-3)
     tmax = max(float(tau_max_s), tmin * 1.01) if tau_max_s is not None else max(hmax * 3.0, tmin * 100.0)
     grid = np.geomspace(tmin, tmax, max(int(tau_points), 16))
@@ -215,6 +241,7 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
         nugget, sill = _fit_nonnegative_line(f, gamma, base_w)
         params[i] = (nugget, sill)
         r = (gamma - (nugget + sill * f)) / np.maximum(se, 1e-15)
+        # Student-t loss over lag bins makes one pathological lag harmless.
         losses[i] = float(np.sum((nu + 1.0) * np.log1p((r * r) / nu)))
 
     logw = -0.5 * (losses - float(np.min(losses)))
@@ -228,6 +255,8 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
     p10 = _weighted_quantile(grid, weights, 0.10)
     p50 = _weighted_quantile(grid, weights, 0.50)
     p90 = _weighted_quantile(grid, weights, 0.90)
+    best_idx = int(np.argmax(weights))
+    # Use the profile parameters nearest the posterior median for diagnostics.
     med_idx = int(np.argmin(np.abs(np.log(grid) - math.log(max(p50, 1e-12)))))
     nugget, sill = map(float, params[med_idx])
 
@@ -245,7 +274,13 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
 
     total_var = max(nugget + sill, 1e-18)
     signal_fraction = max(0.0, min(1.0, sill / total_var))
+    # Weak latent motion cannot identify a time constant, even with millions of
+    # noisy samples.  Ramp confidence smoothly rather than imposing a hard
+    # process/noise ratio threshold.
     signal_conf = max(0.0, min(1.0, (signal_fraction - 0.02) / 0.28))
+
+    # A characteristic time is only well observed if the lag range extends
+    # past its knee.  About 3*tau reaches 95% of the exponential plateau.
     coverage_conf = max(0.0, min(1.0, hmax / max(3.0 * p50, 1e-12)))
 
     fmed = 1.0 - np.exp(-h / max(p50, 1e-12))
@@ -255,6 +290,9 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
     fit_conf = 1.0 / (1.0 + max(fit_error - 1.0, 0.0))
 
     boundary_conf = max(0.0, 1.0 - min(edge_mass, 1.0))
+    # Geometric-like combination: every term represents a necessary condition,
+    # but square roots avoid making confidence needlessly tiny for one merely
+    # mediocre component.
     confidence = posterior_conf
     confidence *= math.sqrt(max(signal_conf, 0.0))
     confidence *= math.sqrt(max(coverage_conf, 0.0))
@@ -262,6 +300,9 @@ def estimate_characteristic_time(points: list[tuple[float, float, float]], *,
     confidence *= boundary_conf
     confidence = max(0.0, min(1.0, confidence))
 
+    # If the fitted process amplitude is negligible, tau is fundamentally
+    # unidentifiable.  Returning None is more honest than exposing an arbitrary
+    # profile minimum for a flat/noise-only signal.
     insufficient_signal = signal_fraction < 0.05
     identifiable = (
         not insufficient_signal
