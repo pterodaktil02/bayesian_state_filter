@@ -49,7 +49,6 @@ def test_posterior_uncertainty_stays_finite_and_positive():
         assert out.y_var > 0.0
         assert math.isfinite(out.y_var)
 
-
 def test_backdated_observation_is_rejected():
     filt = make_filter()
     filt.step(Observation(t=100.0, z=20.0, variance=0.05**2))
@@ -69,3 +68,4 @@ def test_equal_timestamp_uses_minimum_positive_dt():
 
     assert math.isclose(out.dt, 1e-3, rel_tol=0.0, abs_tol=1e-12)
     assert filt.t_last == 100.0
+
