@@ -43,6 +43,7 @@ class DynamicsBank:
         self._last_event_t = None
         self._ready = False
 
+        # Constant part of Student-t log density.
         self._t_const = (
             math.lgamma((self.nu + 1.0) / 2.0)
             - math.lgamma(self.nu / 2.0)
@@ -116,9 +117,11 @@ class DynamicsBank:
         a, qxx, qxv, qvv = self._q_terms(dt)
         b = self._tau * (1.0 - a)
 
+        # Predict state.
         x0p = self._x0 + b * self._x1
         x1p = a * self._x1
 
+        # Predict symmetric covariance FPF' + Q.
         p00p = self._p00 + 2.0 * b * self._p01 + b * b * self._p11 + qxx
         p01p = a * (self._p01 + b * self._p11) + qxv
         p11p = a * a * self._p11 + qvv
@@ -135,6 +138,8 @@ class DynamicsBank:
             - 0.5 * (self.nu + 1.0) * np.log1p(z2 / self.nu)
         )
 
+        # Always-on robust update.  Cap at one: inliers never get more gain
+        # than their Gaussian counterpart.
         rw = np.minimum(1.0, np.maximum(1e-4, (self.nu + 1.0) / (self.nu + z2)))
         S_eff = S / rw
         k0 = p00p / S_eff
@@ -142,6 +147,8 @@ class DynamicsBank:
         self._x0 = x0p + k0 * innovation
         self._x1 = x1p + k1 * innovation
 
+        # Equivalent to the Joseph update for scalar H=[1,0] and the effective
+        # Student-t measurement variance, but cheaper and symmetric by form.
         self._p00 = np.maximum(p00p - k0 * p00p, 1e-15)
         self._p01 = p01p - k0 * p01p
         self._p11 = np.maximum(p11p - k1 * p01p, 1e-18)
@@ -174,6 +181,7 @@ class DynamicsBank:
             return None
         w = self._weights()
         tw = np.zeros(len(self.tau_grid), dtype=float)
+        # Hypotheses are laid out tau-major, then q-factor.
         nq = len(self.q_factors)
         for i in range(len(self.tau_grid)):
             tw[i] = float(w[i * nq:(i + 1) * nq].sum())
@@ -192,6 +200,9 @@ class DynamicsBank:
         entropy_conf = max(0.0, min(1.0, 1.0 - entropy / max_entropy))
         raw_confidence = 0.6 * width_conf + 0.4 * entropy_conf
         edge_mass = float(tw[0] + tw[-1])
+        # A narrow posterior pinned to a search boundary is not a high-confidence
+        # identification; it is a censored lower/upper bound.  Penalize the
+        # reported confidence accordingly instead of returning a misleading 0.9+.
         confidence = raw_confidence * max(0.0, 1.0 - edge_mass)
         boundary_limited = edge_mass >= 0.25
         identifiable = (
