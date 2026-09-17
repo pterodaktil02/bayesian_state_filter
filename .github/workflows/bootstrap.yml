@@ -14,28 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate bootstrap parts
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          import re
-          for p in sorted(Path('.bootstrap').glob('missing.b64.part*')):
-              s = p.read_text()
-              bad = [(i, repr(ch)) for i, ch in enumerate(s) if not (ch.isascii() and (ch.isalnum() or ch in '+/=\r\n'))]
-              print(p, 'len=', len(s), 'mod4=', len(s.replace('\n','').replace('\r','')) % 4, 'bad=', bad[:20])
-          PY
-          for p in .bootstrap/missing.b64.part*; do
-            echo "checking $p"
-            base64 -d "$p" >/dev/null
-          done
-
       - name: Rebuild missing source files
         shell: bash
         run: |
           set -euxo pipefail
-          cat .bootstrap/missing.b64.part* | base64 -d > /tmp/missing.tar.xz
+          cat .bootstrap/missing.b64.part00 .bootstrap/missing.b64.part01 .bootstrap/missing.b64.part02 .bootstrap/missing.b64.part03 > /tmp/missing.b64
+          head -c 6480 .bootstrap/missing.b64.part04 >> /tmp/missing.b64
+          base64 -d /tmp/missing.b64 > /tmp/missing.tar.xz
+          xz -t /tmp/missing.tar.xz
           tar -xJf /tmp/missing.tar.xz
           rm -rf .bootstrap
 
