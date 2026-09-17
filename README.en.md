@@ -386,13 +386,12 @@ pytest -q
 
 The test suite covers robust outlier handling, posterior uncertainty, bias calibration, pairwise source variance calibration, recovery of known synthetic source sigmas, history order invariance, live time-ordering/backdating policy, startup repeatability, correlated fast-source noise and synthetic OU characteristic-time estimation.
 
-# Authors and license
+# Authors and contributions
 
-Authors:
+**Evgeny V. Polupanov** — project originator, requirements author, and practical development lead.
 
-- **E. V. Polupanov** (`Е. В. Полупанов`)
-- **G. P. Timofeev** (`Г. П. Тимофеев`)
+**Grigory P. Timofeev** — engineering and software co-author.
 
-See also [`AUTHORS.md`](AUTHORS.md).
+See [`AUTHORS.md`](AUTHORS.md) for the detailed contribution breakdown.
 
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0-only)**. See [`LICENSE`](LICENSE) for the full text.
