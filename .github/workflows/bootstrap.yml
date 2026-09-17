@@ -1,0 +1,36 @@
+name: Finish repository bootstrap
+
+on:
+  push:
+    paths:
+      - ".github/workflows/bootstrap.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild missing source files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat .bootstrap/missing.b64.part* | base64 -d > /tmp/missing.tar.xz
+          tar -xJf /tmp/missing.tar.xz
+          rm -rf .bootstrap
+
+      - name: Commit completed repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Publish Bayesian State Filter 0.2.1.6"
+          git push
