@@ -880,8 +880,23 @@ tests/
 README.md
 README.en.md
 CHANGELOG.md
+AUTHORS.md
+LICENSE
 requirements-dev.txt
 ```
+
+---
+
+# 22. Авторы и лицензия
+
+Авторы:
+
+- **Е. В. Полупанов**
+- **Г. П. Тимофеев**
+
+Полный список также находится в [`AUTHORS.md`](AUTHORS.md).
+
+Проект распространяется на условиях **GNU General Public License v3.0 (GPL-3.0-only)**. Полный текст лицензии находится в файле [`LICENSE`](LICENSE).
 
 ---
 
