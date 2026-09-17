@@ -18,8 +18,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          cat .bootstrap/missing.b64.part00 .bootstrap/missing.b64.part01 .bootstrap/missing.b64.part02 .bootstrap/missing.b64.part03 > /tmp/missing.b64
-          head -c 6480 .bootstrap/missing.b64.part04 >> /tmp/missing.b64
+          cat .bootstrap/missing.b64.part00 .bootstrap/missing.b64.part01 .bootstrap/missing.b64.part02 .bootstrap/missing.b64.part03 .bootstrap/missing.b64.part04a .bootstrap/missing.b64.part04b > /tmp/missing.b64
           base64 -d /tmp/missing.b64 > /tmp/missing.tar.xz
           xz -t /tmp/missing.tar.xz
           tar -xJf /tmp/missing.tar.xz
