@@ -4,7 +4,11 @@ import math
 
 import numpy as np
 
-from custom_components.bayesian_state_filter.core.training import calibrate_history
+from custom_components.bayesian_state_filter.core.training import (
+    OnlineSourceCalibrator,
+    SourceCalibration,
+    calibrate_history,
+)
 
 
 def test_history_calibration_recovers_relative_biases():
@@ -170,3 +174,108 @@ def test_history_calibration_is_order_invariant():
     for source in ordered_result.sources:
         assert ordered_result.sources[source].bias == shuffled_result.sources[source].bias
         assert ordered_result.sources[source].sigma == shuffled_result.sources[source].sigma
+
+
+
+def test_startup_pair_evidence_is_returned():
+    rng = np.random.default_rng(20260918)
+    times = np.arange(0.0, 6 * 3600.0, 20.0)
+    latent = 1000.0 + 0.4 * np.sin(times / 1800.0)
+    histories = {
+        "a": list(zip(times, latent + rng.normal(0, 0.03, len(times)))),
+        "b": list(zip(times + 0.4, latent + 0.2 + rng.normal(0, 0.05, len(times)))),
+        "c": list(zip(times + 0.8, latent - 0.3 + rng.normal(0, 0.08, len(times)))),
+    }
+
+    result = calibrate_history(histories, tau_points=8)
+
+    assert result.startup_pair_rows
+    assert result.calibration_window_s >= 3600.0
+    for calibration in result.sources.values():
+        assert calibration.startup_sigma > 0
+        assert math.isclose(
+            calibration.startup_sigma,
+            calibration.sigma,
+            rel_tol=0,
+            abs_tol=1e-15,
+        )
+        assert calibration.calibration_window_s == result.calibration_window_s
+        assert calibration.startup_calibration_samples > 0
+
+
+def test_short_live_burst_cannot_replace_week_of_startup_evidence():
+    window = 7 * 86400.0
+    calibrations = {
+        "a": SourceCalibration(
+            sigma=0.10,
+            startup_sigma=0.10,
+            startup_calibration_samples=100000,
+            startup_calibration_span=window,
+            startup_calibration_pairs=2,
+            calibration_window_s=window,
+        ),
+        "b": SourceCalibration(
+            sigma=0.12,
+            startup_sigma=0.12,
+            startup_calibration_samples=100000,
+            startup_calibration_span=window,
+            startup_calibration_pairs=2,
+            calibration_window_s=window,
+        ),
+        "c": SourceCalibration(
+            sigma=0.15,
+            startup_sigma=0.15,
+            startup_calibration_samples=100000,
+            startup_calibration_span=window,
+            startup_calibration_pairs=2,
+            calibration_window_s=window,
+        ),
+    }
+    startup = [
+        ("a", "b", 0.10**2 + 0.12**2, 50000, window),
+        ("a", "c", 0.10**2 + 0.15**2, 50000, window),
+        ("b", "c", 0.12**2 + 0.15**2, 50000, window),
+    ]
+    calibrator = OnlineSourceCalibrator(
+        calibrations,
+        startup_pair_rows=startup,
+        calibration_window_s=window,
+    )
+    calibrator._online_start_time = 0.0
+
+    live = [
+        ("a", "b", 4.0, 60, 60.0),
+        ("a", "c", 4.0, 60, 60.0),
+        ("b", "c", 4.0, 60, 60.0),
+    ]
+    combined = calibrator._combine_startup_and_live_rows(
+        live, now=60.0, window=window
+    )
+    by_pair = {(a, b): variance for a, b, variance, _n, _s in combined}
+
+    assert by_pair[("a", "b")] < 0.026
+    assert by_pair[("a", "c")] < 0.034
+    assert by_pair[("b", "c")] < 0.038
+
+
+def test_startup_evidence_expires_after_one_full_window():
+    window = 1000.0
+    calibrations = {
+        "a": SourceCalibration(sigma=0.1),
+        "b": SourceCalibration(sigma=0.1),
+    }
+    startup = [("a", "b", 0.02, 100, window)]
+    live = [("a", "b", 0.50, 100, window)]
+    calibrator = OnlineSourceCalibrator(
+        calibrations,
+        startup_pair_rows=startup,
+        calibration_window_s=window,
+    )
+    calibrator._online_start_time = 0.0
+
+    combined = calibrator._combine_startup_and_live_rows(
+        live, now=window + 1, window=window
+    )
+
+    assert len(combined) == 1
+    assert combined[0][2] == 0.50
