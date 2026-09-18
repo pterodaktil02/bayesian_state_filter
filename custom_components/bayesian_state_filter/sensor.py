@@ -9,8 +9,8 @@ from functools import partial
 from datetime import datetime, timedelta, timezone
 
 from homeassistant.components.sensor import SensorEntity
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 
 from .const import (
@@ -169,20 +169,24 @@ class BayesianEnsembleSensor(SensorEntity):
             return None
 
     async def async_added_to_hass(self):
-        async_track_state_change_event(self.hass, self.sources, self._handle_event)
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass, self.sources, self._handle_event
+            )
+        )
 
-        async def _after_start(event):
+        async def _after_start(_hass):
             try:
                 await self._initialize()
             except Exception:
-                _LOGGER.exception("Bayesian State Filter 0.2.1.6 initialization failed")
+                _LOGGER.exception("Bayesian State Filter 0.2.1.7 initialization failed")
                 await self._restore_fallback()
             self._seed_current_sources()
             self._ready = True
             if self._state is not None:
                 self.async_write_ha_state()
 
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _after_start)
+        self.async_on_remove(async_at_started(self.hass, _after_start))
 
     async def async_will_remove_from_hass(self):
         if self._warmup_task is not None:
@@ -219,7 +223,11 @@ class BayesianEnsembleSensor(SensorEntity):
             )
         )
         self._calibrations = result.sources
-        self._source_cal = OnlineSourceCalibrator(self._calibrations)
+        self._source_cal = OnlineSourceCalibrator(
+            self._calibrations,
+            startup_pair_rows=result.startup_pair_rows,
+            calibration_window_s=result.calibration_window_s,
+        )
         if self._calibrations:
             sigmas = sorted(c.sigma for c in self._calibrations.values() if c.sigma > 0)
             if sigmas:
@@ -246,7 +254,7 @@ class BayesianEnsembleSensor(SensorEntity):
             self._build_attrs(last_out=None)
             await self._save_state()
             _LOGGER.info(
-                "Bayesian State Filter 0.2.1.6 trained from %.2f d: velocity_tau=%.1f s "
+                "Bayesian State Filter 0.2.1.7 trained from %.2f d: velocity_tau=%.1f s "
                 "(conf=%.3f), characteristic_time=%s (status=%s, conf=%.3f)",
                 result.history_span / 86400.0,
                 self.filter.tau,
@@ -617,9 +625,22 @@ class BayesianEnsembleSensor(SensorEntity):
                 self._level_grid_step = max(float(result.grid_step), 1.0)
                 self._level_history = deque(result.fused_points[-20000:], maxlen=20000)
             # Preserve live calibration if it has more evidence; only fill
-            # missing sources from warmup training.
+            # missing sources from warmup training. If this is the first real
+            # pairwise calibration, seed its compact historical evidence so
+            # online sigma adaptation starts continuously rather than from an
+            # empty pair buffer.
             for src, c in result.sources.items():
                 self._calibrations.setdefault(src, c)
+            if self._source_cal is None:
+                self._source_cal = OnlineSourceCalibrator(
+                    self._calibrations,
+                    startup_pair_rows=result.startup_pair_rows,
+                    calibration_window_s=result.calibration_window_s,
+                )
+            elif result.startup_pair_rows and not self._source_cal.startup_pair_rows:
+                self._source_cal.seed_startup_evidence(
+                    result.startup_pair_rows, result.calibration_window_s
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -874,11 +895,35 @@ class BayesianEnsembleSensor(SensorEntity):
                 "outliers": int(c.outliers),
                 "outlier_rate": round(c.outlier_rate, 5),
                 "history_samples": int(c.samples),
+                # Current working pairwise evidence. In 0.2.1.7 this is a
+                # continuous startup+live rolling-window estimate.
                 "calibration_samples": int(c.calibration_samples),
                 "calibration_span_s": round(c.calibration_span, 1),
                 "calibration_pairs": int(c.calibration_pairs),
+                "startup_calibration_samples": int(c.startup_calibration_samples),
+                "startup_calibration_span_s": round(c.startup_calibration_span, 1),
+                "startup_calibration_pairs": int(c.startup_calibration_pairs),
+                "startup_sigma": (
+                    round(c.startup_sigma, 8) if c.startup_sigma > 0 else None
+                ),
+                "calibration_window_s": (
+                    round(c.calibration_window_s, 1)
+                    if c.calibration_window_s > 0 else None
+                ),
                 "live_updates": int(c.updates),
             }
+            if self._source_cal is not None:
+                item.update({
+                    "live_calibration_samples": int(
+                        self._source_cal.live_calibration_samples.get(src, 0)
+                    ),
+                    "live_calibration_span_s": round(
+                        self._source_cal.live_calibration_span.get(src, 0.0), 1
+                    ),
+                    "live_calibration_pairs": int(
+                        self._source_cal.live_calibration_pairs.get(src, 0)
+                    ),
+                })
             d = self._source_last_diag.get(src)
             if d is not None:
                 item.update({
@@ -941,7 +986,7 @@ class BayesianEnsembleSensor(SensorEntity):
 
     def _select_noise_model(self, st=None):
         mode = self._noise_mode_cfg
-        # ``auto`` is intentionally conservative in 0.2.1.6 and therefore
+        # ``auto`` is intentionally conservative in 0.2.1.7 and therefore
         # selects Gaussian.  The public mode/family split is already in place
         # so a future history-based detector can select Poisson without a YAML
         # or attribute-schema migration.  Explicit ``poisson`` remains
