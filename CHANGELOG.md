@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1.7
+
+- Added `bayesian_state_filter.reload` for YAML configuration reloads without a full Home Assistant restart.
+- Reload teardown now unregisters state listeners, and entity initialization works both during normal startup and when a YAML platform is recreated while Home Assistant is already running.
+- Added integration/service translations so the YAML reload UI shows **Bayesian State Filter** instead of the raw domain name.
+- Made startup and live pairwise sigma calibration continuous: Recorder-derived pair evidence is retained compactly and ages out over the same rolling calibration window while live evidence replaces it.
+- Prevented a short dense live burst after restart/reload from immediately replacing a multi-day startup sigma estimate.
+- Expanded `source_health` with startup/live calibration evidence, `startup_sigma`, and `calibration_window_s`.
+- Kept the Bayesian state model, Student-t robust update, characteristic-time estimator and persistence key compatible with 0.2.1.6.
+
 ## 0.2.1.6
 
 Review hardening before the first public push:
