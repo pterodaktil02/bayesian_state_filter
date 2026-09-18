@@ -1,6 +1,6 @@
 # Bayesian State Filter for Home Assistant
 
-Version: **0.2.1.6**
+Version: **0.2.1.7**
 
 [Русский README](README.md)
 
@@ -26,9 +26,14 @@ to:
 /config/custom_components/bayesian_state_filter
 ```
 
-Then perform a full Home Assistant restart.
+After installing or updating the integration files, perform a full Home Assistant restart.
 
-Version 0.2.1.6 uses YAML sensor-platform configuration; there is no Config Flow yet.
+Starting with 0.2.1.7, later YAML edits can be applied without restarting Home Assistant:
+call `bayesian_state_filter.reload` or use **Settings -> System -> YAML -> Bayesian State Filter**.
+Reload re-reads YAML and recreates this platform's sensor entities; listeners owned by removed
+entities are unsubscribed during teardown.
+
+Version 0.2.1.7 uses YAML sensor-platform configuration; there is no Config Flow yet.
 
 ## Minimal configuration
 
@@ -106,7 +111,7 @@ max(3 * source_median_dt,
 - Default: `auto`
 - Accepted: `auto`, `gaussian`, `poisson`
 
-`auto` is intentionally conservative in 0.2.1.6 and currently selects Gaussian. The public interface is already split into `noise_model_mode` and active `noise_model` so future Poisson auto-detection will not require YAML migration.
+`auto` is intentionally conservative in 0.2.1.7 and currently selects Gaussian. The public interface is already split into `noise_model_mode` and active `noise_model` so future Poisson auto-detection will not require YAML migration.
 
 Gaussian:
 
@@ -210,7 +215,7 @@ This is not the Recorder history window and not the pairwise source-calibration 
 
 Student-t degrees of freedom. Lower values have heavier tails and downweight large outliers more aggressively. Larger values approach Gaussian updating.
 
-Robust updating is always enabled in 0.2.1.6; there is no `robust_enable` switch.
+Robust updating is always enabled in 0.2.1.7; there is no `robust_enable` switch.
 
 ## `bayes.diagnostics`
 
@@ -308,15 +313,34 @@ Per source:
 - `outliers`: strong live outliers since current startup.
 - `outlier_rate`: `outliers / live_updates`; always interpret with the denominator.
 - `history_samples`: raw Recorder samples used at startup.
-- `calibration_samples`: pairwise residual samples supporting source calibration.
-- `calibration_span_s`: time span of pairwise calibration evidence.
-- `calibration_pairs`: number of peer sources contributing usable pairwise equations.
+- `calibration_samples`: current effective pairwise evidence: the still-active startup fraction plus live evidence inside the rolling calibration window. It is not necessarily a count of unique raw source samples.
+- `calibration_span_s`: current time span of the working pairwise evidence.
+- `calibration_pairs`: number of peer sources currently contributing usable pairwise equations.
+- `startup_calibration_samples`: historical pairwise evidence used by startup calibration; immutable after startup.
+- `startup_calibration_span_s`: Recorder time span covered by startup pairwise evidence.
+- `startup_calibration_pairs`: peer-source count in the startup calibration.
+- `startup_sigma`: source sigma immediately after startup calibration.
+- `calibration_window_s`: rolling sigma-calibration horizon over which startup evidence ages out.
 - `live_updates`: live updates processed since startup.
+- `live_calibration_samples`: actual live pairwise residuals accumulated since startup.
+- `live_calibration_span_s`: live pairwise evidence time span.
+- `live_calibration_pairs`: peer sources already contributing usable live pairs.
 - `last_raw_value`: latest raw source value.
 - `last_corrected_value`: value after the bias used at that exact update.
 - `last_innovation`: latest source innovation.
 - `last_z_score`: latest source z-score.
 - `last_robust_weight`: latest Student-t weight.
+
+In 0.2.1.7 startup and live sigma calibration form one rolling evidence window.
+The first live recalculation no longer discards Recorder evidence. Historical
+pairwise evidence ages out over `calibration_window_s` while live pairs fill the
+same horizon, so a dense short burst from a fast source cannot replace a
+multi-day startup estimate in a few seconds. Raw historical pair residuals are
+not kept in memory; startup evidence is retained compactly as pair variance,
+pair count and time span.
+
+`startup_calibration_samples` may exceed `history_samples` because one source
+sample can contribute to separate pairwise equations with multiple peer sensors.
 
 # Full diagnostics
 
@@ -357,7 +381,7 @@ Live observations must be non-decreasing in time. A genuinely backdated observat
 
 # Known limitations and roadmap
 
-The following improvements are intentionally deferred from 0.2.1.6 so the already-tested estimator is not mixed with a large behavioral refactor:
+The following improvements are intentionally deferred from 0.2.1.7 so the already-tested estimator is not mixed with a large behavioral refactor:
 
 - Config Flow / Options Flow while retaining YAML compatibility;
 - real `noise_model: auto` detection for Gaussian vs Poisson observation noise;
@@ -369,7 +393,7 @@ Internal numerical constants such as the minimum Student-t weight, PSD floor and
 
 # Legacy notes
 
-`robust_enable` is not a documented option in 0.2.1.6. Student-t robustness is always active.
+`robust_enable` is not a documented option in 0.2.1.7. Student-t robustness is always active.
 
 `save_every_s` belongs inside `bayes:`.
 
