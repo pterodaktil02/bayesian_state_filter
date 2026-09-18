@@ -50,6 +50,14 @@ class SourceCalibration:
     calibration_samples: int = 0
     calibration_span: float = 0.0
     calibration_pairs: int = 0
+    # Snapshot of the Recorder/history evidence used at startup.  The legacy
+    # calibration_* fields above remain the current working evidence and may
+    # later be replaced by online pairwise calibration statistics.
+    startup_calibration_samples: int = 0
+    startup_calibration_span: float = 0.0
+    startup_calibration_pairs: int = 0
+    startup_sigma: float = 0.0
+    calibration_window_s: float = 0.0
     outliers: int = 0
     updates: int = 0
 
@@ -86,6 +94,11 @@ class TrainingResult:
     fused_points: list[tuple[float, float, float]]
     grid_step: float
     history_span: float
+    # Compact pairwise evidence used to make startup -> online calibration a
+    # continuous rolling-window transition without retaining millions of raw
+    # pair residuals in Home Assistant memory.
+    startup_pair_rows: list[tuple[str, str, float, int, float]] | None = None
+    calibration_window_s: float = 0.0
 
 
 def _clean_history(seq):
@@ -407,6 +420,10 @@ def _recalibrate_recent_sigmas(histories, calib, *, recent_window_s, tau=None):
         c.calibration_samples = int(source_counts.get(src, 0))
         c.calibration_span = float(source_span.get(src, 0.0))
         c.calibration_pairs = int(pair_counts.get(src, 0))
+        c.startup_calibration_samples = c.calibration_samples
+        c.startup_calibration_span = c.calibration_span
+        c.startup_calibration_pairs = c.calibration_pairs
+        c.startup_sigma = float(c.sigma)
     return rows
 
 def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
@@ -483,10 +500,12 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
     recent_window = _calibration_window_s(
         preliminary_characteristic, dts=dts, span=span
     )
-    _recalibrate_recent_sigmas(
+    startup_pair_rows = _recalibrate_recent_sigmas(
         histories, calib, recent_window_s=recent_window,
         tau=(preliminary_characteristic.tau if preliminary_characteristic is not None else None),
     )
+    for c in calib.values():
+        c.calibration_window_s = float(recent_window)
 
     # Rebuild observation variances with the recent source-noise calibration,
     # then fit the published characteristic time and predictive dynamics.
@@ -525,21 +544,73 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
     for t, z, var in fused[1:]:
         bank.update(t, z, var)
     estimate = bank.estimate()
-    return TrainingResult(calib, estimate, bank, characteristic, fused, step, span)
+    return TrainingResult(
+        calib, estimate, bank, characteristic, fused, step, span,
+        startup_pair_rows=list(startup_pair_rows),
+        calibration_window_s=float(recent_window),
+    )
 
 
 class OnlineSourceCalibrator:
-    """Slow bias tracker plus time-aligned pairwise noise calibration."""
+    """Slow bias tracker plus rolling pairwise noise calibration.
 
-    def __init__(self, calibrations: dict[str, SourceCalibration]):
+    Startup pairwise variance evidence is retained as a compact prior and ages
+    out over the same calibration window that produced the startup sigma.  This
+    avoids the previous discontinuity where seven days of Recorder evidence
+    could be replaced by the first few seconds/minutes of live pairs after a
+    restart or YAML reload.
+    """
+
+    def __init__(self, calibrations: dict[str, SourceCalibration], *,
+                 startup_pair_rows=None, calibration_window_s: float | None = None):
         self.calibrations = calibrations
         self.cache = {}  # src -> (t, raw value)
         # Cross-source snapshot residuals are used only for relative bias.
         self.residuals = {src: deque() for src in calibrations}
-        # Pairwise close-in-time residuals estimate observation variances.
+        # Live close-in-time residuals.  Historical evidence is kept compactly
+        # in startup_pair_rows below rather than as millions of Python tuples.
         self.pair_residuals: dict[tuple[str, str], deque] = {}
         self.last_pair_sample: dict[tuple[str, str], tuple[float, float]] = {}
+        self.startup_pair_rows: dict[tuple[str, str], tuple[str, str, float, int, float]] = {}
+        for row in startup_pair_rows or []:
+            sa, sb, pair_var, count, span = row
+            key = self._pair_key(sa, sb)
+            self.startup_pair_rows[key] = (
+                key[0], key[1], float(pair_var), int(count), float(span)
+            )
+        try:
+            w = float(calibration_window_s) if calibration_window_s is not None else 0.0
+        except (TypeError, ValueError):
+            w = 0.0
+        self.calibration_window_s = w if math.isfinite(w) and w > 0 else 0.0
+        self._online_start_time: float | None = None
+
+        # Online evidence is tracked separately so diagnostics show both the
+        # Recorder/history basis and what has accumulated since startup.
+        self.live_calibration_samples = {src: 0 for src in calibrations}
+        self.live_calibration_span = {src: 0.0 for src in calibrations}
+        self.live_calibration_pairs = {src: 0 for src in calibrations}
         self._last_updated_source: str | None = None
+
+    def seed_startup_evidence(self, rows, calibration_window_s: float | None = None):
+        """Seed compact startup evidence when history training arrives later."""
+        if rows:
+            self.startup_pair_rows.clear()
+            for row in rows:
+                sa, sb, pair_var, count, span = row
+                key = self._pair_key(sa, sb)
+                self.startup_pair_rows[key] = (
+                    key[0], key[1], float(pair_var), int(count), float(span)
+                )
+        if calibration_window_s is not None:
+            try:
+                w = float(calibration_window_s)
+            except (TypeError, ValueError):
+                w = 0.0
+            if math.isfinite(w) and w > 0:
+                self.calibration_window_s = w
+        # New startup evidence defines a new rolling-window origin.
+        self._online_start_time = None
 
     def ensure_source(self, src: str, value: float, t: float):
         if src not in self.calibrations:
@@ -548,6 +619,9 @@ class OnlineSourceCalibrator:
                 median_dt=60.0, typical_abs_level=max(abs(value), 1e-9), samples=0,
             )
             self.residuals[src] = deque()
+            self.live_calibration_samples[src] = 0
+            self.live_calibration_span[src] = 0.0
+            self.live_calibration_pairs[src] = 0
         self.cache[src] = (float(t), float(value))
         self._last_updated_source = src
 
@@ -614,9 +688,98 @@ class OnlineSourceCalibrator:
             spans[sb] = max(spans[sb], span)
         return rows, counts, spans
 
+
+    def _combine_startup_and_live_rows(self, live_rows, *, now: float, window: float):
+        """Blend startup and live pair evidence by rolling-window time coverage.
+
+        The startup row summarizes the historical part of [now-window, now].
+        As wall-clock time advances after startup, that historical portion ages
+        out linearly while live rows fill the same interval.  Once one full
+        window has elapsed, startup evidence contributes exactly zero.
+        """
+        live_map = {self._pair_key(r[0], r[1]): r for r in live_rows}
+        if not self.startup_pair_rows:
+            return list(live_rows)
+
+        if self._online_start_time is None:
+            self._online_start_time = float(now)
+        elapsed = max(float(now) - self._online_start_time, 0.0)
+        w = max(float(window), 1.0)
+        old_fraction = max(1.0 - min(elapsed / w, 1.0), 0.0)
+
+        combined = []
+        for key in sorted(set(self.startup_pair_rows) | set(live_map)):
+            sr = self.startup_pair_rows.get(key)
+            lr = live_map.get(key)
+
+            if sr is None:
+                combined.append(lr)
+                continue
+            if old_fraction <= 0.0:
+                if lr is not None:
+                    combined.append(lr)
+                continue
+            if lr is None:
+                sa, sb, svar, scount, sspan = sr
+                remaining_count = int(round(old_fraction * max(int(scount), 1)))
+                if remaining_count >= 8:
+                    remaining_span = max(float(sspan) - elapsed, 0.0)
+                    combined.append((sa, sb, float(svar), remaining_count, remaining_span))
+                continue
+
+            sa, sb, svar, scount, sspan = sr
+            _la, _lb, lvar, lcount, lspan = lr
+            live_fraction = min(max(float(lspan), 0.0) / w, 1.0)
+            denom = old_fraction + live_fraction
+            if denom <= 0.0:
+                continue
+            pair_var = (
+                old_fraction * float(svar) + live_fraction * float(lvar)
+            ) / denom
+            count = max(1, int(round(
+                old_fraction * max(int(scount), 1) + max(int(lcount), 1)
+            )))
+            remaining_startup_span = max(float(sspan) - elapsed, 0.0)
+            span = min(w, remaining_startup_span + max(float(lspan), 0.0))
+            combined.append((sa, sb, float(pair_var), count, float(span)))
+        return combined
+
+    def _combined_source_evidence(self, live_counts, live_spans, pair_rows, *, now, window):
+        """Return diagnostics for the current startup+live working evidence."""
+        if self._online_start_time is None:
+            self._online_start_time = float(now)
+        elapsed = max(float(now) - self._online_start_time, 0.0)
+        w = max(float(window), 1.0)
+        old_fraction = max(1.0 - min(elapsed / w, 1.0), 0.0)
+
+        pair_counts = {src: 0 for src in self.calibrations}
+        for sa, sb, _var, _count, _span in pair_rows:
+            pair_counts[sa] = pair_counts.get(sa, 0) + 1
+            pair_counts[sb] = pair_counts.get(sb, 0) + 1
+
+        counts = {}
+        spans = {}
+        for src, c in self.calibrations.items():
+            live_span = float(live_spans.get(src, 0.0))
+            if old_fraction > 0.0:
+                counts[src] = int(round(
+                    old_fraction * int(c.startup_calibration_samples)
+                    + int(live_counts.get(src, 0))
+                ))
+                remaining_startup_span = max(
+                    float(c.startup_calibration_span) - elapsed, 0.0
+                )
+                spans[src] = min(w, remaining_startup_span + live_span)
+            else:
+                counts[src] = int(live_counts.get(src, 0))
+                spans[src] = live_span
+        return counts, spans, pair_counts
+
     def update_snapshot(self, now: float, tau: float, updated_source: str | None = None):
         if len(self.cache) < 2:
             return
+        if self._online_start_time is None:
+            self._online_start_time = float(now)
         fresh = {}
         for src, (t, z) in self.cache.items():
             c = self.calibrations[src]
@@ -628,11 +791,14 @@ class OnlineSourceCalibrator:
 
         corrected = [z - self.calibrations[src].bias for src, z in fresh.items()]
         ref = _median(corrected)
-        window = max(3.0 * tau, 10.0 * _median([self.calibrations[s].median_dt for s in fresh], 60.0), 3600.0)
+        dynamic_window = max(
+            3.0 * tau,
+            10.0 * _median([self.calibrations[s].median_dt for s in fresh], 60.0),
+            3600.0,
+        )
+        window = self.calibration_window_s or dynamic_window
         cutoff = now - window
 
-        # Bias remains a robust cross-source quantity.  This path is unchanged
-        # conceptually from 2.1: only sigma calibration is pairwise/aligned.
         for src, z in fresh.items():
             dq = self.residuals.setdefault(src, deque())
             dq.append((now, z - ref))
@@ -649,14 +815,24 @@ class OnlineSourceCalibrator:
         if not src_now or not self._record_close_pairs(now, tau, src_now):
             return
 
-        rows, counts, spans = self._pair_rows_live(now, window)
+        live_rows, live_counts, live_spans = self._pair_rows_live(now, window)
+        live_pair_counts = {src: 0 for src in self.calibrations}
+        for sa, sb, _var, _count, _span in live_rows:
+            live_pair_counts[sa] = live_pair_counts.get(sa, 0) + 1
+            live_pair_counts[sb] = live_pair_counts.get(sb, 0) + 1
+        for src in self.calibrations:
+            self.live_calibration_samples[src] = int(live_counts.get(src, 0))
+            self.live_calibration_span[src] = float(live_spans.get(src, 0.0))
+            self.live_calibration_pairs[src] = int(live_pair_counts.get(src, 0))
+
+        rows = self._combine_startup_and_live_rows(live_rows, now=now, window=window)
         solved = _solve_source_variances(self.calibrations, rows)
         if not solved:
             return
-        pair_counts = {src: 0 for src in self.calibrations}
-        for sa, sb, _var, _count, _span in rows:
-            pair_counts[sa] = pair_counts.get(sa, 0) + 1
-            pair_counts[sb] = pair_counts.get(sb, 0) + 1
+
+        counts, spans, pair_counts = self._combined_source_evidence(
+            live_counts, live_spans, rows, now=now, window=window
+        )
         for src, var in solved.items():
             c = self.calibrations[src]
             target = math.sqrt(max(var, 1e-12))
@@ -666,4 +842,3 @@ class OnlineSourceCalibrator:
             c.calibration_samples = int(counts.get(src, 0))
             c.calibration_span = float(spans.get(src, 0.0))
             c.calibration_pairs = int(pair_counts.get(src, 0))
-
