@@ -1,0 +1,9 @@
+{
+  "title": "Bayesian State Filter",
+  "services": {
+    "reload": {
+      "name": "Reload",
+      "description": "Reloads the Bayesian State Filter YAML configuration."
+    }
+  }
+}
