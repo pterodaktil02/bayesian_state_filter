@@ -1,0 +1,9 @@
+{
+  "title": "Bayesian State Filter",
+  "services": {
+    "reload": {
+      "name": "Перезагрузить",
+      "description": "Перечитывает YAML-конфигурацию Bayesian State Filter."
+    }
+  }
+}
