@@ -55,9 +55,25 @@ ATTR_UPDATE_DT = "update_dt_s"
 # knobs: changing them alters numerical robustness/freshness policy rather than
 # the physical model. Keeping them named makes the policy auditable.
 NUMERIC_VARIANCE_FLOOR = 1e-15
-STUDENT_T_MIN_WEIGHT = 1e-4
+STUDENT_T_MIN_WEIGHT = 0.05
 FRESHNESS_MEDIAN_DT_MULTIPLIER = 3.0
 FRESHNESS_TAU_FRACTION = 0.20
 FRESHNESS_MIN_S = 300.0
 CHARACTERISTIC_REFIT_MIN_S = 300.0
 
+
+# v0.3 full [x,v,a,j] posterior diagnostics. Derivative values are exposed in
+# human-scale per-hour units while the internal state remains per-second.
+ATTR_RATE_PER_HOUR = "rate_per_hour"
+ATTR_CURVATURE_PER_HOUR2 = "curvature_per_hour2"
+ATTR_JERK_PER_HOUR3 = "jerk_per_hour3"
+ATTR_RATE_WEIGHT = "rate_weight"
+ATTR_CURVATURE_WEIGHT = "curvature_weight"
+ATTR_JERK_WEIGHT = "jerk_weight"
+ATTR_RATE_Z = "rate_z"
+ATTR_CURVATURE_Z = "curvature_z"
+ATTR_JERK_Z = "jerk_z"
+ATTR_GATED_TIMESCALE = "gated_timescale_s"
+ATTR_GATED_LOCAL_RMSE = "gated_local_rmse"
+ATTR_GATED_LOCAL_RMSE_STEP1 = "gated_local_rmse_step1"
+ATTR_GATED_LOCAL_RMSE_STEP2 = "gated_local_rmse_step2"

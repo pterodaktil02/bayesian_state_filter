@@ -34,14 +34,20 @@ from .const import (
     ATTR_FILTER_MODE, ATTR_PROCESS_NOISE, ATTR_SOURCE_HEALTH,
     ATTR_MEASUREMENT_VARIANCE, ATTR_EFFECTIVE_INNOVATION_VARIANCE,
     ATTR_UPDATE_DT,
+    ATTR_RATE_PER_HOUR, ATTR_CURVATURE_PER_HOUR2, ATTR_JERK_PER_HOUR3,
+    ATTR_RATE_WEIGHT, ATTR_CURVATURE_WEIGHT, ATTR_JERK_WEIGHT,
+    ATTR_RATE_Z, ATTR_CURVATURE_Z, ATTR_JERK_Z,
+    ATTR_GATED_TIMESCALE, ATTR_GATED_LOCAL_RMSE,
+    ATTR_GATED_LOCAL_RMSE_STEP1, ATTR_GATED_LOCAL_RMSE_STEP2,
     NUMERIC_VARIANCE_FLOOR, STUDENT_T_MIN_WEIGHT,
     FRESHNESS_MEDIAN_DT_MULTIPLIER, FRESHNESS_TAU_FRACTION,
     FRESHNESS_MIN_S, CHARACTERISTIC_REFIT_MIN_S,
 )
 from .core.filter import CoreFilter
 from .core.noise_models import GaussianNoise, PoissonLikeNoise
-from .core.process_noise import DampedAccelerationProcessNoise
-from .core.state_models import LevelVelocityModel
+from .core.process_noise import IntegratedWienerProcessNoise
+from .core.state_models import AdaptivePolynomialStateModel
+from .core.gated_training import GatedDynamicsEstimate, train_gated_dynamics
 from .core.training import (
     OnlineSourceCalibrator,
     SourceCalibration,
@@ -59,7 +65,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class BayesianEnsembleSensor(SensorEntity):
-    """Bayesian State Filter 0.2.1.x.
+    """Bayesian State Filter 0.3.0.
 
     Backward-compatible YAML platform.  The implementation is intentionally
     source-aware: raw observations are never collapsed into one irreversible
@@ -88,7 +94,7 @@ class BayesianEnsembleSensor(SensorEntity):
             )
             self._noise_mode_cfg = "auto"
         self._history_days = max(float(bayes_cfg.get("history_days", 7.0)), 0.1)
-        self._save_every_s = max(float(bayes_cfg.get("save_every_s", 60.0)), 5.0)
+        self._save_every_s = max(float(bayes_cfg.get("save_every_s", 1800.0)), 5.0)
         self._tau_points = max(int(bayes_cfg.get("tau_points", 16)), 8)
         # ``tau_min/max_s`` remain the bounds for the predictive velocity model
         # for backward compatibility.  The level-process characteristic time
@@ -121,17 +127,20 @@ class BayesianEnsembleSensor(SensorEntity):
 
         default_tau = self._tau_min_s or 3600.0
         self.filter = CoreFilter(
-            state_model=LevelVelocityModel(tau=default_tau),
+            state_model=AdaptivePolynomialStateModel(3),
             noise_model=self._gaussian_noise,
-            updater=StudentTUpdater(nu=self._student_nu, min_weight=STUDENT_T_MIN_WEIGHT),
-            process_noise=DampedAccelerationProcessNoise(q_acc=1e-9, tau=default_tau),
+            updater=StudentTUpdater(nu=self._student_nu, min_weight=0.05),
+            process_noise=IntegratedWienerProcessNoise(order=3, q=0.0),
+            prior_timescale_s=default_tau,
         )
 
         self._calibrations: dict[str, SourceCalibration] = {}
         self._source_cal: OnlineSourceCalibrator | None = None
-        # Predictive velocity-model hyperparameters.
-        self._dynamics_bank = None
-        self._dynamics = None
+        # Full [x,v,a,j] dynamics identified from history.  The state order is
+        # fixed; posterior confidence gates only derivative coupling.
+        self._gated_dynamics: GatedDynamicsEstimate | None = None
+        self._dynamics_bank = None  # legacy field retained only for migration-safe code paths
+        self._dynamics = None       # legacy field retained only for old diagnostics
         # Independent level-process characteristic-time estimate.
         self._characteristic: CharacteristicTimeEstimate | None = None
         self._level_history = deque(maxlen=20000)
@@ -155,8 +164,10 @@ class BayesianEnsembleSensor(SensorEntity):
         self._source_last_diag: dict[str, dict] = {}
         self._ready = False
         self._last_save_ts = 0.0
+        self._checkpoint_version = 4
+        self._last_processed_by_source: dict[str, float] = {}
         # New key: old v1 snapshot has incompatible semantics (notably q).
-        self._store = Store(hass, 1, f"{DOMAIN}_{slug}_v21")
+        self._store = Store(hass, 1, f"{DOMAIN}_{slug}_v31")
 
     @staticmethod
     def _optional_float(value):
@@ -179,7 +190,7 @@ class BayesianEnsembleSensor(SensorEntity):
             try:
                 await self._initialize()
             except Exception:
-                _LOGGER.exception("Bayesian State Filter 0.2.1.7 initialization failed")
+                _LOGGER.exception("Bayesian State Filter 0.3.0 initialization failed")
                 await self._restore_fallback()
             self._seed_current_sources()
             self._ready = True
@@ -200,6 +211,23 @@ class BayesianEnsembleSensor(SensorEntity):
     # ------------------------------------------------------------------
 
     async def _initialize(self):
+        # Fast path: a v2 checkpoint contains the complete learned state.
+        # Restore it and replay only Recorder observations that arrived after
+        # the checkpoint.  The expensive multi-day training pass is therefore
+        # performed only for the first bootstrap (or after an incompatible
+        # checkpoint/schema change).
+        if await self._restore_checkpoint():
+            await self._catch_up_from_recorder()
+            self._select_noise_model()
+            if self.filter.t_last is not None:
+                self._state = round(float(self.filter.x[0]), 6)
+                self._build_attrs(last_out=None)
+            _LOGGER.info(
+                "Bayesian State Filter 0.3.0 restored checkpoint and caught up incrementally; t=%.3f",
+                float(self.filter.t_last or 0.0),
+            )
+            return
+
         histories = {}
         for entity_id in self.sources:
             seq = await self._fetch_history(entity_id)
@@ -232,33 +260,52 @@ class BayesianEnsembleSensor(SensorEntity):
             sigmas = sorted(c.sigma for c in self._calibrations.values() if c.sigma > 0)
             if sigmas:
                 self._gaussian_noise.set_sigma(sigmas[len(sigmas) // 2])
-        self._dynamics_bank = result.bank
-        self._dynamics = result.dynamics
+        self._dynamics_bank = None
+        self._dynamics = None
         self._characteristic = result.characteristic
         self._level_grid_step = max(float(result.grid_step), 1.0)
         self._level_history = deque(result.fused_points[-20000:], maxlen=20000)
         if result.fused_points:
             self._last_characteristic_fit_ts = float(result.fused_points[-1][0])
 
-        if self._dynamics is not None:
-            # This is velocity_tau: a predictive model hyperparameter.  It is
-            # intentionally independent of characteristic_time.
-            self.filter.tau = self._dynamics.tau
-            self.filter.q_acc = self._dynamics.q_acc
+        # Identify q/timescale for the permanent confidence-gated [x,v,a,j]
+        # model.  Confidence itself is not fitted: c(z)=erf(|z|/sqrt(2)).
+        self._gated_dynamics = None
+        dynamics_points = result.dynamics_points or result.fused_points
+        if len(dynamics_points) >= 40:
+            try:
+                self._gated_dynamics = await self.hass.async_add_executor_job(
+                    lambda: train_gated_dynamics(dynamics_points, nu=self._student_nu)
+                )
+            except Exception:
+                _LOGGER.exception("Bayesian State Filter gated dynamics training failed")
+        if self._gated_dynamics is not None:
+            T = self._gated_dynamics.timescale_s
+            if not math.isfinite(T) or T <= 0:
+                T = max(self._gated_dynamics.history_span_s, self._level_grid_step, 1.0)
+            self.filter.tau = T
+            self.filter.q_process = self._gated_dynamics.q_process
 
         self._select_noise_model()
 
         if result.fused_points:
-            await self.hass.async_add_executor_job(self._replay_fused, result.fused_points)
+            await self.hass.async_add_executor_job(self._replay_fused, dynamics_points)
+            # The full history bootstrap has consumed all source history through
+            # each source's last Recorder sample.  Remember those watermarks so
+            # the next restart can request only the unseen tail.
+            self._last_processed_by_source = {
+                src: float(seq[-1][0]) for src, seq in histories.items() if seq
+            }
             self._state = round(float(self.filter.x[0]), 6)
             self._build_attrs(last_out=None)
             await self._save_state()
             _LOGGER.info(
-                "Bayesian State Filter 0.2.1.7 trained from %.2f d: velocity_tau=%.1f s "
-                "(conf=%.3f), characteristic_time=%s (status=%s, conf=%.3f)",
+                "Bayesian State Filter 0.3.1 trained from %.2f d: gated_tau=%s q=%s "
+                "local_rmse=%s characteristic_time=%s (status=%s, conf=%.3f)",
                 result.history_span / 86400.0,
-                self.filter.tau,
-                self._dynamics.confidence if self._dynamics else 0.0,
+                (f"{self.filter.tau:.1f} s" if self._gated_dynamics is not None else "fallback"),
+                f"{self.filter.q_process:.6e}",
+                (f"{self._gated_dynamics.validation_rmse:.6g}" if self._gated_dynamics is not None else "unknown"),
                 (f"{self._characteristic.tau:.1f} s" if self._characteristic and self._characteristic.tau is not None else "unknown"),
                 self._characteristic.status if self._characteristic else "unavailable",
                 self._characteristic.confidence if self._characteristic else 0.0,
@@ -274,7 +321,7 @@ class BayesianEnsembleSensor(SensorEntity):
         for t, z, var in points[1:]:
             self.filter.step(Observation(t=t, z=z, variance=var, source="history_fusion"))
 
-    async def _fetch_history(self, entity_id):
+    async def _fetch_history(self, entity_id, start_ts: float | None = None):
         """Fetch raw recorder history for one source.
 
         Home Assistant removed the old ``history.get_states`` helper.  Use the
@@ -284,7 +331,7 @@ class BayesianEnsembleSensor(SensorEntity):
         current HA and made startup fall back to warmup.
         """
         now = datetime.now(timezone.utc)
-        start = now - timedelta(days=self._history_days)
+        start = (datetime.fromtimestamp(float(start_ts), timezone.utc) if start_ts is not None else now - timedelta(days=self._history_days))
         try:
             from homeassistant.components.recorder import get_instance
             from homeassistant.components.recorder.history import get_significant_states
@@ -350,17 +397,30 @@ class BayesianEnsembleSensor(SensorEntity):
             return
         if not math.isfinite(raw):
             return
-
         self._inherit_metadata(st)
-        t = self._state_timestamp(st)
-        src = st.entity_id
+        await self._process_sample(
+            st.entity_id, raw, self._state_timestamp(st),
+            st=st, write_state=True, allow_save=True, schedule_background=True,
+        )
 
+    async def _process_sample(self, src: str, raw: float, t: float, *, st=None,
+                              write_state: bool, allow_save: bool,
+                              schedule_background: bool):
+        """Process one raw source observation through the normal live path.
+
+        Recorder catch-up calls this with output/background work disabled, so
+        restart replay is mathematically the same as live processing without
+        flooding HA state writes or checkpoint saves.
+        """
         if self._source_cal is None:
             self._source_cal = OnlineSourceCalibrator(self._calibrations)
         self._source_cal.ensure_source(src, raw, t)
         cal = self._calibrations[src]
         self._update_source_dt(cal, src, t)
         self._source_cal.update_snapshot(t, self._window_tau(), updated_source=src)
+        self._last_processed_by_source[src] = max(
+            float(t), float(self._last_processed_by_source.get(src, float("-inf")))
+        )
 
         if self._fresh_source_count(t) < self.min_sources:
             self._warmup_history.setdefault(src, []).append((t, raw))
@@ -372,10 +432,6 @@ class BayesianEnsembleSensor(SensorEntity):
         mode = self._select_noise_model(st)
         variance = cal.variance(corrected, noise_mode=mode)
 
-        # Cold start: median is supplied by the source calibrator cache if there
-        # are peers; otherwise the first source value is the only honest prior.
-        # Keep source_corrected unchanged: diagnostics should always describe
-        # what this source actually contributed before any bootstrap fallback.
         if self.filter.t_last is None:
             bootstrap = self._bootstrap_median(t)
             corrected = bootstrap if bootstrap is not None else corrected
@@ -391,8 +447,6 @@ class BayesianEnsembleSensor(SensorEntity):
         if weight < 0.25 or z > 4.0:
             cal.outliers += 1
 
-        # Snapshot the exact live observation diagnostics for this source.
-        # These values are never fed back into filtering/calibration.
         self._source_last_diag[src] = {
             "raw": float(raw),
             "corrected": float(source_corrected),
@@ -403,47 +457,65 @@ class BayesianEnsembleSensor(SensorEntity):
 
         self._update_dynamics(t, corrected, variance, out.dt)
         self._append_level_snapshot(t)
-        self._maybe_schedule_characteristic_fit(t)
+        if schedule_background:
+            self._maybe_schedule_characteristic_fit(t)
         self._state = round(out.y_mean, 6)
         self._last_source = src
         self._remember_update_diag(out)
         self._build_attrs(last_out=out)
-        self.async_write_ha_state()
+        if write_state:
+            self.async_write_ha_state()
 
         self._warmup_history.setdefault(src, []).append((t, raw))
         self._trim_warmup_history(t)
-        if self._dynamics_bank is None:
+        if schedule_background and self._gated_dynamics is None:
             self._maybe_schedule_warmup_training()
 
-        if t - self._last_save_ts >= self._save_every_s:
+        if allow_save and t - self._last_save_ts >= self._save_every_s:
             self._last_save_ts = t
             await self._save_state()
 
-    def _update_dynamics(self, t, corrected, variance, dt):
-        if self._dynamics_bank is None:
-            return
-        self._dynamics_bank.update(t, corrected, variance)
-        est = self._dynamics_bank.estimate()
-        if est is None:
-            return
-        self._dynamics = est
-        if not est.identifiable:
-            return
+    async def _catch_up_from_recorder(self):
+        """Replay only source observations newer than the persisted watermarks."""
+        events = []
+        global_floor = float(self.filter.t_last or 0.0)
+        for src in self.sources:
+            watermark = float(self._last_processed_by_source.get(src, global_floor))
+            # Include a tiny overlap because Recorder's include-start semantics
+            # and timestamp precision differ between HA versions; duplicates are
+            # discarded explicitly below.
+            seq = await self._fetch_history(src, start_ts=max(watermark - 1.0, 0.0))
+            for t, raw in self._parse_states(seq):
+                if t <= watermark + 1e-6:
+                    continue
+                events.append((float(t), src, float(raw)))
 
-        # The posterior may move quickly; the filter's working parameters do
-        # not.  Log-space blending prevents a tau-window feedback oscillation.
-        alpha = min(0.03, max(float(dt), 0.0) / max(10.0 * self.filter.tau, 1.0))
-        alpha *= max(est.confidence, 0.1)
-        if alpha <= 0:
-            return
-        self.filter.tau = math.exp(
-            (1.0 - alpha) * math.log(self.filter.tau)
-            + alpha * math.log(max(est.tau, 1e-6))
-        )
-        self.filter.q_acc = math.exp(
-            (1.0 - alpha) * math.log(max(self.filter.q_acc, 1e-18))
-            + alpha * math.log(max(est.q_acc, 1e-18))
-        )
+        events.sort(key=lambda x: (x[0], x[1]))
+        replayed = 0
+        for t, src, raw in events:
+            # A late Recorder row older than the already-restored global filter
+            # state cannot be replayed into a causal Kalman filter.  It was
+            # already represented by the checkpoint and is safely skipped.
+            if self.filter.t_last is not None and t < float(self.filter.t_last) - 1e-6:
+                self._last_processed_by_source[src] = max(
+                    t, self._last_processed_by_source.get(src, t)
+                )
+                continue
+            await self._process_sample(
+                src, raw, t, st=None, write_state=False, allow_save=False,
+                schedule_background=False,
+            )
+            replayed += 1
+
+        if replayed:
+            self._build_attrs(last_out=None)
+            await self._save_state()
+        _LOGGER.info("Bayesian State Filter incremental catch-up replayed %d source observations", replayed)
+
+    def _update_dynamics(self, t, corrected, variance, dt):
+        # Structural q/timescale are identified from history and persisted.
+        # Live observations update the [x,v,a,j] posterior only.
+        return
 
     def _window_tau(self):
         """Time scale used only for robust/source-maintenance windows.
@@ -616,16 +688,27 @@ class BayesianEnsembleSensor(SensorEntity):
                     characteristic_tau_max_s=self._char_tau_max_s,
                 )
             )
-            if result.bank is not None:
-                self._dynamics_bank = result.bank
-                self._dynamics = result.dynamics
+            self._dynamics_bank = None
+            self._dynamics = None
             if result.characteristic is not None:
                 self._characteristic = result.characteristic
             if result.fused_points:
                 self._level_grid_step = max(float(result.grid_step), 1.0)
                 self._level_history = deque(result.fused_points[-20000:], maxlen=20000)
+                if len(result.fused_points) >= 40:
+                    try:
+                        self._gated_dynamics = await self.hass.async_add_executor_job(
+                            lambda: train_gated_dynamics((result.dynamics_points or result.fused_points), nu=self._student_nu)
+                        )
+                        T = self._gated_dynamics.timescale_s
+                        if not math.isfinite(T) or T <= 0:
+                            T = max(self._gated_dynamics.history_span_s, self._level_grid_step, 1.0)
+                        self.filter.tau = T
+                        self.filter.q_process = self._gated_dynamics.q_process
+                    except Exception:
+                        _LOGGER.exception("Bayesian State Filter warmup gated dynamics training failed")
             # Preserve live calibration if it has more evidence; only fill
-            # missing sources from warmup training. If this is the first real
+            # missing sources from warmup training.  If this is the first real
             # pairwise calibration, seed its compact historical evidence so
             # online sigma adaptation starts continuously rather than from an
             # empty pair buffer.
@@ -651,29 +734,70 @@ class BayesianEnsembleSensor(SensorEntity):
     # ------------------------------------------------------------------
 
     async def _save_state(self):
-        dyn = None
-        if self._dynamics is not None:
-            dyn = {
-                "tau": self._dynamics.tau,
-                "q_acc": self._dynamics.q_acc,
-                "p10": self._dynamics.p10,
-                "p90": self._dynamics.p90,
-                "confidence": self._dynamics.confidence,
-                "entropy_confidence": self._dynamics.entropy_confidence,
-                "samples": self._dynamics.samples,
-                "identifiable": self._dynamics.identifiable,
-                "edge_mass": self._dynamics.edge_mass,
-                "boundary_limited": self._dynamics.boundary_limited,
-            }
+        now_ts = float(self.filter.t_last or datetime.now(timezone.utc).timestamp())
+        source_cal_state = (
+            self._source_cal.dump_compact(now_ts, self._window_tau())
+            if self._source_cal is not None else None
+        )
         await self._store.async_save({
+            "checkpoint_version": self._checkpoint_version,
+            "saved_at": datetime.now(timezone.utc).timestamp(),
             "filter": self.filter.dump_state(),
             "sources": {k: v.dump() for k, v in self._calibrations.items()},
-            "dynamics": dyn,
+            "source_calibrator": source_cal_state,
+            "gated_dynamics": (self._gated_dynamics.dump() if self._gated_dynamics is not None else None),
             "characteristic": self._characteristic.dump() if self._characteristic is not None else None,
             "level_grid_step": self._level_grid_step,
+            "level_history": [list(p) for p in self._level_history],
+            "last_characteristic_fit_ts": self._last_characteristic_fit_ts,
+            "last_processed_by_source": self._last_processed_by_source,
         })
+        self._last_save_ts = datetime.now(timezone.utc).timestamp()
+
+    async def _restore_checkpoint(self) -> bool:
+        saved = await self._store.async_load()
+        if not saved or int(saved.get("checkpoint_version", 0)) != self._checkpoint_version:
+            return False
+        try:
+            self.filter.load_state(saved.get("filter", {}))
+            if self.filter.t_last is None:
+                return False
+            self._calibrations = {
+                k: SourceCalibration.load(v) for k, v in (saved.get("sources", {}) or {}).items()
+            }
+            if not self._calibrations:
+                return False
+            self._source_cal = OnlineSourceCalibrator.load_compact(
+                saved.get("source_calibrator"), self._calibrations
+            )
+            self._dynamics_bank = None
+            self._dynamics = None
+            self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
+            c = saved.get("characteristic") or {}
+            self._characteristic = CharacteristicTimeEstimate.load(c) if c else None
+            self._level_grid_step = max(float(saved.get("level_grid_step", 60.0)), 1.0)
+            level_history = []
+            for row in saved.get("level_history", []) or []:
+                if len(row) >= 3:
+                    level_history.append((float(row[0]), float(row[1]), float(row[2])))
+            self._level_history = deque(level_history[-20000:], maxlen=20000)
+            self._last_characteristic_fit_ts = float(saved.get("last_characteristic_fit_ts", 0.0) or 0.0)
+            self._last_processed_by_source = {
+                str(k): float(v) for k, v in (saved.get("last_processed_by_source", {}) or {}).items()
+            }
+            if self._calibrations:
+                sigmas = sorted(c.sigma for c in self._calibrations.values() if c.sigma > 0)
+                if sigmas:
+                    self._gaussian_noise.set_sigma(sigmas[len(sigmas) // 2])
+            self._state = round(float(self.filter.x[0]), 6)
+            self._build_attrs(last_out=None)
+            return True
+        except Exception:
+            _LOGGER.exception("Bayesian State Filter checkpoint restore failed; falling back to full training")
+            return False
 
     async def _restore_fallback(self):
+        """Best-effort restore for legacy snapshots when Recorder is unavailable."""
         saved = await self._store.async_load()
         if not saved:
             return
@@ -681,14 +805,12 @@ class BayesianEnsembleSensor(SensorEntity):
         self._calibrations = {
             k: SourceCalibration.load(v) for k, v in (saved.get("sources", {}) or {}).items()
         }
-        self._source_cal = OnlineSourceCalibrator(self._calibrations)
-        d = saved.get("dynamics") or {}
-        if d:
-            from .core.dynamics import DynamicsEstimate
-            try:
-                self._dynamics = DynamicsEstimate(**d)
-            except Exception:
-                self._dynamics = None
+        self._source_cal = OnlineSourceCalibrator.load_compact(
+            saved.get("source_calibrator"), self._calibrations
+        )
+        self._dynamics = None
+        self._dynamics_bank = None
+        self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
         c = saved.get("characteristic") or {}
         if c:
             try:
@@ -699,6 +821,17 @@ class BayesianEnsembleSensor(SensorEntity):
             self._level_grid_step = max(float(saved.get("level_grid_step", 60.0)), 1.0)
         except Exception:
             self._level_grid_step = 60.0
+        rows = []
+        for row in saved.get("level_history", []) or []:
+            try:
+                rows.append((float(row[0]), float(row[1]), float(row[2])))
+            except Exception:
+                continue
+        if rows:
+            self._level_history = deque(rows[-20000:], maxlen=20000)
+        self._last_processed_by_source = {
+            str(k): float(v) for k, v in (saved.get("last_processed_by_source", {}) or {}).items()
+        }
         if self.filter.t_last is not None:
             self._state = round(float(self.filter.x[0]), 6)
             self._build_attrs(last_out=None)
@@ -765,7 +898,25 @@ class BayesianEnsembleSensor(SensorEntity):
         laboratory diagnostics from 2.1.0 for troubleshooting and research.
         """
         var = max(float(self.filter.P[0, 0]), 0.0)
-        velocity = float(self.filter.x[1])
+        velocity = float(self.filter.x[1]) if len(self.filter.x) > 1 else 0.0
+        acceleration = float(self.filter.x[2]) if len(self.filter.x) > 2 else 0.0
+        jerk = float(self.filter.x[3]) if len(self.filter.x) > 3 else 0.0
+        dt_weight = self._level_grid_step
+        if self._last_update_diag is not None:
+            dt_weight = max(float(self._last_update_diag.get("update_dt_s", dt_weight)), 1e-6)
+        model = self.filter.state_model
+        if hasattr(model, "effective_weights"):
+            eff_w = model.effective_weights(self.filter.x, self.filter.P, dt_weight)
+            conf_w = model.confidence_weights(self.filter.x, self.filter.P)
+        else:
+            eff_w = [1.0] * len(self.filter.x)
+            conf_w = eff_w
+
+        def _z(order):
+            if order >= len(self.filter.x):
+                return 0.0
+            sigma = math.sqrt(max(float(self.filter.P[order, order]), NUMERIC_VARIANCE_FLOOR))
+            return abs(float(self.filter.x[order])) / sigma
 
         # Compact public surface: state uncertainty, robust update health,
         # source calibration, and the independently estimated level-process
@@ -783,7 +934,25 @@ class BayesianEnsembleSensor(SensorEntity):
             ATTR_NOISE_MODEL_PARAMS: self._noise_model_params(),
             ATTR_NOISE_VARIANCE_SOURCE: ("per_source_calibration" if self._calibrations else "model_default"),
             ATTR_SOURCE_HEALTH: self._source_health(),
+            # Full state is always [x,v,a,j]. Internal derivative units are per
+            # second; publish human-scale per-hour diagnostics.
+            ATTR_RATE_PER_HOUR: round(velocity * 3600.0, 10),
+            ATTR_CURVATURE_PER_HOUR2: round(acceleration * (3600.0 ** 2), 10),
+            ATTR_JERK_PER_HOUR3: round(jerk * (3600.0 ** 3), 10),
+            ATTR_RATE_WEIGHT: round(float(eff_w[1]), 6) if len(eff_w) > 1 else 0.0,
+            ATTR_CURVATURE_WEIGHT: round(float(eff_w[2]), 6) if len(eff_w) > 2 else 0.0,
+            ATTR_JERK_WEIGHT: round(float(eff_w[3]), 6) if len(eff_w) > 3 else 0.0,
+            ATTR_RATE_Z: round(_z(1), 4),
+            ATTR_CURVATURE_Z: round(_z(2), 4),
+            ATTR_JERK_Z: round(_z(3), 4),
+            ATTR_GATED_TIMESCALE: round(float(self.filter.tau), 3),
         }
+        if self._gated_dynamics is not None:
+            attrs.update({
+                ATTR_GATED_LOCAL_RMSE: round(float(self._gated_dynamics.validation_rmse), 10),
+                ATTR_GATED_LOCAL_RMSE_STEP1: round(float(self._gated_dynamics.validation_rmse_step1), 10),
+                ATTR_GATED_LOCAL_RMSE_STEP2: round(float(self._gated_dynamics.validation_rmse_step2), 10),
+            })
 
         # Level-process characteristic time: variogram estimate, entirely
         # separate from the damped-velocity tau used internally by CoreFilter.
@@ -834,7 +1003,7 @@ class BayesianEnsembleSensor(SensorEntity):
                 ATTR_VARIANCE: round(var, 10),
                 ATTR_VELOCITY: round(velocity, 10),
                 ATTR_VELOCITY_TIME: round(self.filter.tau, 3),
-                ATTR_PROCESS_NOISE: f"{self.filter.q_acc:.6e}",
+                ATTR_PROCESS_NOISE: f"{self.filter.q_process:.6e}",
             })
 
             if self._characteristic is not None:
@@ -849,15 +1018,6 @@ class BayesianEnsembleSensor(SensorEntity):
                     ATTR_CHARACTERISTIC_PAIR_COUNT: int(c.pair_count),
                     ATTR_CHARACTERISTIC_MIN_LAG: round(c.min_lag, 3),
                     ATTR_CHARACTERISTIC_MAX_LAG: round(c.max_lag, 3),
-                })
-
-            if self._dynamics is not None:
-                attrs.update({
-                    ATTR_VELOCITY_TIME_P10: round(self._dynamics.p10, 3),
-                    ATTR_VELOCITY_TIME_P90: round(self._dynamics.p90, 3),
-                    ATTR_VELOCITY_TIME_CONFIDENCE: round(self._dynamics.confidence, 4),
-                    ATTR_VELOCITY_TIME_EDGE_MASS: round(self._dynamics.edge_mass, 4),
-                    ATTR_VELOCITY_TIME_BOUNDARY_LIMITED: bool(self._dynamics.boundary_limited),
                 })
 
             if self._last_update_diag is not None:
@@ -895,11 +1055,15 @@ class BayesianEnsembleSensor(SensorEntity):
                 "outliers": int(c.outliers),
                 "outlier_rate": round(c.outlier_rate, 5),
                 "history_samples": int(c.samples),
-                # Current working pairwise evidence. In 0.2.1.7 this is a
-                # continuous startup+live rolling-window estimate.
+                # Current working pairwise evidence.  In 0.2.1.7 this is a
+                # continuous startup+live rolling-window estimate; the startup
+                # evidence ages out over calibration_window_s instead of being
+                # replaced by the first short live burst after reload.
                 "calibration_samples": int(c.calibration_samples),
                 "calibration_span_s": round(c.calibration_span, 1),
                 "calibration_pairs": int(c.calibration_pairs),
+                # Explicit history/startup evidence, kept immutable so it does
+                # not disappear from diagnostics after live calibration starts.
                 "startup_calibration_samples": int(c.startup_calibration_samples),
                 "startup_calibration_span_s": round(c.startup_calibration_span, 1),
                 "startup_calibration_pairs": int(c.startup_calibration_pairs),
@@ -986,7 +1150,7 @@ class BayesianEnsembleSensor(SensorEntity):
 
     def _select_noise_model(self, st=None):
         mode = self._noise_mode_cfg
-        # ``auto`` is intentionally conservative in 0.2.1.7 and therefore
+        # ``auto`` is intentionally conservative in 0.3.0 and therefore
         # selects Gaussian.  The public mode/family split is already in place
         # so a future history-based detector can select Poisson without a YAML
         # or attribute-schema migration.  Explicit ``poisson`` remains

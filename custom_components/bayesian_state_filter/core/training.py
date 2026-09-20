@@ -99,6 +99,11 @@ class TrainingResult:
     # pair residuals in Home Assistant memory.
     startup_pair_rows: list[tuple[str, str, float, int, float]] | None = None
     calibration_window_s: float = 0.0
+    # Dedicated local-dynamics grid.  This mirrors the proven trend-filter
+    # bootstrap: common overlap, linear interpolation, natural cadence and only
+    # a generic 150k computational ceiling.  Kept separate from the
+    # hold-last-value grid used by source calibration/characteristic-time work.
+    dynamics_points: list[tuple[float, float, float]] | None = None
 
 
 def _clean_history(seq):
@@ -326,10 +331,10 @@ def _make_grid(histories, step, freshness):
     ts_by_src = {k: [p[0] for p in seq] for k, seq in histories.items()}
     grid = []
     t = math.ceil(start / step) * step
-    # Cap at 20k points for bounded HA startup cost; enlarge step if necessary.
+    # Cap at 150k points: preserve local dynamics while bounding one-time bootstrap cost.
     n_est = int((end - t) / step) + 1
-    if n_est > 20000:
-        step *= math.ceil(n_est / 20000)
+    if n_est > 150000:
+        step *= math.ceil(n_est / 150000)
         t = math.ceil(start / step) * step
 
     while t <= end + 1e-9:
@@ -375,6 +380,43 @@ def _build_fused(grid, calib):
         fused.append((float(t), float(zf), float(vf)))
     return fused
 
+
+
+def _build_dynamics_fused(histories, calib, max_points=150000):
+    """Build the prototype-equivalent fused history for x-v-a-j training.
+
+    Returns (t, level, variance).  Source bias/sigma come from the production
+    calibrator, but temporal fusion is deliberately identical in spirit to
+    bayesian_trend_filter v0.6.3: interpolate every calibrated source on the
+    common overlap at its natural ensemble cadence, with only a generic point
+    ceiling.
+    """
+    usable = {src: _clean_history(seq) for src, seq in histories.items() if src in calib and seq}
+    usable = {src: seq for src, seq in usable.items() if seq}
+    if not usable:
+        return []
+    start = max(seq[0][0] for seq in usable.values())
+    end = min(seq[-1][0] for seq in usable.values())
+    if end <= start:
+        return []
+    span = end - start
+    native_dt = _median([max(float(calib[src].median_dt), 1e-6) for src in usable], 60.0)
+    step = max(native_dt, span / max(int(max_points) - 1, 1), 1e-6)
+    grids = np.arange(start, end + 0.5 * step, step, dtype=float)
+    corrected = []
+    variances = []
+    for src, seq in usable.items():
+        tt = np.asarray([x[0] for x in seq], dtype=float)
+        xx = np.asarray([x[1] for x in seq], dtype=float) - float(calib[src].bias)
+        corrected.append(np.interp(grids, tt, xx))
+        variances.append(max(float(calib[src].sigma) ** 2, 1e-12))
+    if not corrected:
+        return []
+    matrix = np.vstack(corrected)
+    fused = np.median(matrix, axis=0)
+    med_var = _median(variances, 1e-4)
+    fused_var = med_var if len(corrected) == 1 else max(0.25 * med_var, med_var / len(corrected), 1e-12)
+    return [(float(t), float(v), float(fused_var)) for t, v in zip(grids, fused)]
 
 def _calibration_window_s(characteristic, *, dts, span):
     """Choose the recent source-calibration window used at startup.
@@ -437,7 +479,7 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
         return TrainingResult({}, None, None, None, [], 60.0, 0.0)
 
     dts = {k: max(_median_dt(v), 1.0) for k, v in histories.items()}
-    step = max(5.0, min(300.0, _median(dts.values(), 60.0)))
+    step = max(1.0, min(300.0, _median(dts.values(), 60.0)))
     freshness = {k: max(3.0 * dts[k], 3.0 * step) for k in histories}
     grid = _make_grid(histories, step, freshness)
     # _make_grid may enlarge its cadence to cap startup work at 20k points.
@@ -517,37 +559,16 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
         tau_max_s=characteristic_tau_max_s,
     )
 
-    deriv = []
-    for i in range(1, len(fused)):
-        dt = fused[i][0] - fused[i - 1][0]
-        if dt > 0:
-            deriv.append((fused[i][1] - fused[i - 1][1]) / dt)
-    slope_scale = max(_mad(deriv), _quantile([abs(v) for v in deriv], 0.5) * 0.25, 1e-12)
-
-    auto_min = max(4.0 * step, 4.0 * min(dts.values()), 10.0)
-    # Permit the model bank to test slower processes instead of pinning the
-    # posterior at span/4.  span/2 is still conservative: values near this
-    # boundary remain explicitly marked as non-identifiable by DynamicsBank.
-    auto_max = max(auto_min * 8.0, span / 2.0)
-    tmin = max(float(tau_min_s), 1.0) if tau_min_s is not None else auto_min
-    tmax = max(float(tau_max_s), tmin * 1.01) if tau_max_s is not None else auto_max
-    if tmax <= tmin:
-        tmax = tmin * 10.0
-    tau_grid = np.geomspace(tmin, tmax, max(int(tau_points), 8))
-
-    bank = DynamicsBank(tau_grid=tau_grid, nu=4.0)
-    if forget_time_s is not None:
-        bank.forget_time_s = max(float(forget_time_s), step)
-    else:
-        bank.forget_time_s = max(3.0 * 86400.0, 8.0 * tmax)
-    bank.initialize(fused[0][0], fused[0][1], fused[0][2], slope_scale)
-    for t, z, var in fused[1:]:
-        bank.update(t, z, var)
-    estimate = bank.estimate()
+    # v0.3: source calibration and level-process characteristic time are
+    # trained here. Full [x,v,a,j] q/timescale identification is performed by
+    # core.gated_training on the same fused history, so the legacy damped-
+    # velocity DynamicsBank is intentionally not built.
+    dynamics_points = _build_dynamics_fused(histories, calib, max_points=150000)
     return TrainingResult(
-        calib, estimate, bank, characteristic, fused, step, span,
+        calib, None, None, characteristic, fused, step, span,
         startup_pair_rows=list(startup_pair_rows),
         calibration_window_s=float(recent_window),
+        dynamics_points=dynamics_points,
     )
 
 
@@ -591,6 +612,56 @@ class OnlineSourceCalibrator:
         self.live_calibration_span = {src: 0.0 for src in calibrations}
         self.live_calibration_pairs = {src: 0 for src in calibrations}
         self._last_updated_source: str | None = None
+
+
+    def dump_compact(self, now: float, tau: float) -> dict:
+        """Persist compact rolling calibration evidence.
+
+        The potentially large live pair-residual deques are collapsed into the
+        same pair-variance rows used by startup calibration.  After restart
+        these rows become the new historical portion of the rolling window, so
+        learning continues without rereading the full Recorder archive.
+        """
+        dynamic_window = max(
+            3.0 * float(tau),
+            10.0 * _median([c.median_dt for c in self.calibrations.values()], 60.0),
+            3600.0,
+        )
+        window = self.calibration_window_s or dynamic_window
+        live_rows, _counts, _spans = self._pair_rows_live(float(now), window)
+        rows = self._combine_startup_and_live_rows(live_rows, now=float(now), window=window)
+        return {
+            "startup_pair_rows": [list(r) for r in rows],
+            "calibration_window_s": float(window),
+            "cache": {k: [float(v[0]), float(v[1])] for k, v in self.cache.items()},
+            "last_updated_source": self._last_updated_source,
+            "snapshot_time": float(now),
+        }
+
+    @classmethod
+    def load_compact(cls, data: dict | None, calibrations: dict[str, SourceCalibration]):
+        if not data:
+            return cls(calibrations)
+        obj = cls(
+            calibrations,
+            startup_pair_rows=data.get("startup_pair_rows") or [],
+            calibration_window_s=data.get("calibration_window_s"),
+        )
+        for src, pair in (data.get("cache") or {}).items():
+            try:
+                if src in calibrations:
+                    obj.cache[src] = (float(pair[0]), float(pair[1]))
+            except Exception:
+                continue
+        obj._last_updated_source = data.get("last_updated_source")
+        # Compact rows represent the rolling window at checkpoint time.  Age
+        # that historical evidence across downtime/catch-up exactly as if the
+        # process had never restarted.
+        try:
+            obj._online_start_time = float(data.get("snapshot_time"))
+        except (TypeError, ValueError):
+            obj._online_start_time = None
+        return obj
 
     def seed_startup_evidence(self, rows, calibration_window_s: float | None = None):
         """Seed compact startup evidence when history training arrives later."""
@@ -688,7 +759,6 @@ class OnlineSourceCalibrator:
             spans[sb] = max(spans[sb], span)
         return rows, counts, spans
 
-
     def _combine_startup_and_live_rows(self, live_rows, *, now: float, window: float):
         """Blend startup and live pair evidence by rolling-window time coverage.
 
@@ -724,11 +794,17 @@ class OnlineSourceCalibrator:
                 remaining_count = int(round(old_fraction * max(int(scount), 1)))
                 if remaining_count >= 8:
                     remaining_span = max(float(sspan) - elapsed, 0.0)
-                    combined.append((sa, sb, float(svar), remaining_count, remaining_span))
+                    combined.append((
+                        sa, sb, float(svar), remaining_count, remaining_span
+                    ))
                 continue
 
             sa, sb, svar, scount, sspan = sr
             _la, _lb, lvar, lcount, lspan = lr
+            # Live evidence is weighted by the fraction of the rolling window
+            # it actually spans.  This prevents a dense 50-second burst from
+            # outweighing seven days of startup evidence simply because it has
+            # many samples.
             live_fraction = min(max(float(lspan), 0.0) / w, 1.0)
             denom = old_fraction + live_fraction
             if denom <= 0.0:
@@ -736,6 +812,9 @@ class OnlineSourceCalibrator:
             pair_var = (
                 old_fraction * float(svar) + live_fraction * float(lvar)
             ) / denom
+            # Retain the fraction of startup observations that is still
+            # inside the rolling window, then add the actual live observations.
+            # _solve_source_variances caps this count at 64 internally.
             count = max(1, int(round(
                 old_fraction * max(int(scount), 1) + max(int(lcount), 1)
             )))
@@ -796,9 +875,15 @@ class OnlineSourceCalibrator:
             10.0 * _median([self.calibrations[s].median_dt for s in fresh], 60.0),
             3600.0,
         )
+        # When startup history exists, keep the exact calibration horizon that
+        # produced startup sigma.  This makes restart/reload continuous.  With
+        # no startup history we retain the previous dynamic-window behavior.
         window = self.calibration_window_s or dynamic_window
         cutoff = now - window
 
+        # Bias remains a robust cross-source quantity.  Bias adaptation keeps
+        # its existing live-window behavior; the continuity fix in 0.2.1.7 is
+        # specifically for pairwise sigma evidence.
         for src, z in fresh.items():
             dq = self.residuals.setdefault(src, deque())
             dq.append((now, z - ref))
@@ -835,6 +920,8 @@ class OnlineSourceCalibrator:
         )
         for src, var in solved.items():
             c = self.calibrations[src]
+            # rows already carry the correct startup/live time weighting; keep
+            # the existing sigma smoother and only change the evidence it sees.
             target = math.sqrt(max(var, 1e-12))
             alpha = min(0.05, max(c.median_dt / max(window, 1.0), 0.005))
             floor = max(c.typical_abs_level * 1e-6, 1e-9)
@@ -842,3 +929,4 @@ class OnlineSourceCalibrator:
             c.calibration_samples = int(counts.get(src, 0))
             c.calibration_span = float(spans.get(src, 0.0))
             c.calibration_pairs = int(pair_counts.get(src, 0))
+

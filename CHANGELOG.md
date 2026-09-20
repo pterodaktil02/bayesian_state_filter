@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1 - 2026-09-20
+
+### Added
+- Production four-dimensional `[x, v, a, j]` state model.
+- Posterior-confidence derivative gating with hierarchical velocity, acceleration and jerk weights.
+- Prototype-equivalent Student-t updater and confidence-gated dynamics training from `bayesian_trend_filter 0.6.3`.
+- Dedicated natural-cadence fused history for dynamics identification.
+- 1-step and 2-step local RMSE diagnostics.
+- 30-minute checkpoints with Recorder-tail replay after restart.
+- Russian and English documentation for the new model and restart path.
+
+### Fixed
+- Corrected the initial v0.3.0 merge so valid Student-t inliers are no longer capped at weight 1.
+- Mean and covariance now use the same confidence-gated transition.
+- Dynamics training and startup replay use the same temporal representation.
+- Checkpoint schema/store key changed so incompatible v0.3.0 state cannot be restored.
+
 ## 0.2.1.7
 
 - Added `bayesian_state_filter.reload` for YAML configuration reloads without a full Home Assistant restart.

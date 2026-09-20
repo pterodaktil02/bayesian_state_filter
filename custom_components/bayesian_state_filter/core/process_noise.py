@@ -1,42 +1,64 @@
+from __future__ import annotations
+
 import math
 import numpy as np
 
 
-class DampedAccelerationProcessNoise:
-    """Exact discrete Q for
+class IntegratedWienerProcessNoise:
+    """White noise on the derivative immediately above the state order.
 
-        dx/dt = v
-        dv/dt = -v/tau + sqrt(q_acc) * white_noise
+    State order 0: x, white velocity noise.
+    State order 1: x-v, white acceleration noise.
+    State order 2: x-v-a, white jerk noise.
+    State order 3: x-v-a-j, white snap noise.
 
-    The small-dt limit is the familiar white-acceleration covariance.
+    q is intentionally not physically clamped. q=0 is a valid deterministic
+    polynomial hypothesis. Numerical regularization belongs in covariance
+    algebra, not in the physical parameter.
     """
 
-    def __init__(self, q_acc: float = 1e-9, tau: float = 3600.0):
-        self.q_acc = max(float(q_acc), 1e-18)
-        self.tau = max(float(tau), 1e-6)
+    def __init__(self, order: int, q: float = 0.0):
+        self.order = int(order)
+        if self.order < 0 or self.order > 3:
+            raise ValueError("order must be between 0 and 3")
+        self.q = self._clean_q(q)
 
-    def Q(self, dt, x=None, *, tau: float | None = None, q_acc: float | None = None):
-        dt = max(float(dt), 1e-9)
-        tau = max(float(self.tau if tau is None else tau), 1e-6)
-        q = max(float(self.q_acc if q_acc is None else q_acc), 1e-18)
-        u = dt / tau
+    @staticmethod
+    def _clean_q(value: float) -> float:
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("process noise q must be finite and >= 0")
+        return value
 
-        # Series form avoids catastrophic cancellation for dt << tau.
-        if u < 1e-4:
-            return q * np.array([
-                [dt**3 / 3.0, dt**2 / 2.0],
-                [dt**2 / 2.0, dt],
-            ], dtype=float)
+    def Q(self, dt: float, q: float | None = None, **_kwargs):
+        qv = self.q if q is None else self._clean_q(q)
+        n = self.order
+        size = n + 1
+        dt = max(float(dt), np.finfo(float).tiny)
+        Q = np.zeros((size, size), dtype=float)
+        if qv == 0.0:
+            return Q
+        for i in range(size):
+            for j in range(size):
+                power = 2 * n + 1 - i - j
+                denom = power * math.factorial(n - i) * math.factorial(n - j)
+                Q[i, j] = qv * (dt ** power) / denom
+        return Q
 
-        a = math.exp(-u)
-        qvv = q * tau * 0.5 * (1.0 - a * a)
-        qxv = q * tau * tau * 0.5 * (1.0 - a) ** 2
-        qxx = q * tau * tau * (
-            dt - 2.0 * tau * (1.0 - a) + 0.5 * tau * (1.0 - a * a)
-        )
-        Q = np.array([[qxx, qxv], [qxv, qvv]], dtype=float)
-        return 0.5 * (Q + Q.T)
 
+class WhiteJerkProcessNoise(IntegratedWienerProcessNoise):
+    """Backward-compatible x-v-a white-jerk process noise alias."""
 
-# Compatibility alias for old imports.
-WhiteAccelerationProcessNoise = DampedAccelerationProcessNoise
+    def __init__(self, q_jerk: float = 0.0):
+        super().__init__(2, q_jerk)
+
+    @property
+    def q_jerk(self) -> float:
+        return self.q
+
+    @q_jerk.setter
+    def q_jerk(self, value: float) -> None:
+        self.q = self._clean_q(value)
+
+    def Q(self, dt: float, q_jerk: float | None = None, **_kwargs):
+        return super().Q(dt, q=self.q if q_jerk is None else q_jerk)

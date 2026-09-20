@@ -6,13 +6,19 @@ from .types import Observation, PosteriorSummary
 
 
 class CoreFilter:
-    """Robust 2-state Bayesian filter with externally learned tau and q."""
+    """Robust Bayesian state filter for a generic polynomial state.
 
-    def __init__(self, state_model, noise_model, updater, process_noise):
+    Production v0.3 uses a fixed full [x, v, a, j] state.  ``tau`` and
+    ``q_acc`` remain compatibility aliases for old persistence/diagnostics;
+    internally they map to the prior time scale and generic process-noise q.
+    """
+
+    def __init__(self, state_model, noise_model, updater, process_noise, prior_timescale_s: float = 60.0):
         self.state_model = state_model
         self.noise_model = noise_model
         self.updater = updater
         self.process_noise = process_noise
+        self.prior_timescale_s = max(float(prior_timescale_s), np.finfo(float).eps)
 
         self.x = np.zeros(state_model.dim_x(), dtype=float)
         self.P = np.eye(state_model.dim_x(), dtype=float)
@@ -21,27 +27,53 @@ class CoreFilter:
         self._last_pred_var = None
 
     @property
+    def q_process(self) -> float:
+        if hasattr(self.process_noise, "q"):
+            return float(self.process_noise.q)
+        if hasattr(self.process_noise, "q_jerk"):
+            return float(self.process_noise.q_jerk)
+        return float(getattr(self.process_noise, "q_acc", 0.0))
+
+    @q_process.setter
+    def q_process(self, value: float) -> None:
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("q_process must be finite and >= 0")
+        if hasattr(self.process_noise, "q"):
+            self.process_noise.q = value
+        elif hasattr(self.process_noise, "q_jerk"):
+            self.process_noise.q_jerk = value
+        else:
+            self.process_noise.q_acc = value
+
+    @property
     def tau(self) -> float:
-        return float(self.state_model.tau)
+        return float(self.prior_timescale_s)
 
     @tau.setter
     def tau(self, value: float) -> None:
-        v = max(float(value), 1e-6)
-        self.state_model.tau = v
-        self.process_noise.tau = v
+        self.prior_timescale_s = max(float(value), np.finfo(float).eps)
 
     @property
     def q_acc(self) -> float:
-        return float(self.process_noise.q_acc)
+        return self.q_process
 
     @q_acc.setter
     def q_acc(self, value: float) -> None:
-        self.process_noise.q_acc = max(float(value), 1e-18)
+        self.q_process = value
 
-    def reset(self, value: float, *, t: float | None = None, variance: float | None = None) -> None:
-        self.x[:] = [float(value), 0.0]
-        v = max(float(variance) if variance is not None else 1.0, 1e-12)
-        self.P = np.array([[v, 0.0], [0.0, v]], dtype=float)
+    def reset(self, value: float, *, t: float | None = None, variance: float | None = None,
+              timescale_s: float | None = None) -> None:
+        var = max(float(variance) if variance is not None else 1.0, NUMERIC_VARIANCE_FLOOR)
+        T = max(float(self.prior_timescale_s if timescale_s is None else timescale_s), np.finfo(float).eps)
+        self.prior_timescale_s = T
+        self.x[:] = 0.0
+        self.x[0] = float(value)
+        diag = [var]
+        tiny = np.finfo(float).tiny
+        for derivative_order in range(1, self.state_model.dim_x()):
+            diag.append(max(var / (T ** (2 * derivative_order)), tiny))
+        self.P = np.diag(diag).astype(float)
         self.t_last = None if t is None else float(t)
         self._last_pred_var = None
         self.mode = "prior"
@@ -52,8 +84,9 @@ class CoreFilter:
             "P": self.P.tolist(),
             "t_last": self.t_last,
             "_last_pred_var": self._last_pred_var,
-            "tau": self.tau,
-            "q_acc": self.q_acc,
+            "q_process": self.q_process,
+            "prior_timescale_s": self.prior_timescale_s,
+            "order": self.state_model.dim_x() - 1,
         }
 
     def load_state(self, data: dict) -> bool:
@@ -68,20 +101,20 @@ class CoreFilter:
             self.P = 0.5 * (P + P.T)
             self.t_last = data.get("t_last")
             self._last_pred_var = data.get("_last_pred_var")
-            if data.get("tau") is not None:
-                self.tau = data["tau"]
-            if data.get("q_acc") is not None:
-                self.q_acc = data["q_acc"]
+            q = data.get("q_process", data.get("q_jerk", data.get("q_acc")))
+            if q is not None:
+                self.q_process = q
+            T = data.get("prior_timescale_s", data.get("tau"))
+            if T is not None:
+                self.tau = T
             self.mode = "tracking"
             return True
         except Exception:
             return False
 
     def _prior_summary(self, obs: Observation) -> PosteriorSummary:
-        var = max(float(obs.variance or 1.0), 1e-12)
+        var = max(float(obs.variance or 1.0), NUMERIC_VARIANCE_FLOOR)
         self.reset(obs.z, t=obs.t, variance=var)
-        # Initial slope uncertainty: one measurement unit per tau.
-        self.P[1, 1] = max(var / (self.tau * self.tau), 1e-18)
         std = math.sqrt(var)
         return PosteriorSummary(
             x_mean=self.x.copy(), x_cov=self.P.copy(),
@@ -90,7 +123,9 @@ class CoreFilter:
             ci68=(obs.z - std, obs.z + std),
             ci95=(obs.z - 1.96 * std, obs.z + 1.96 * std),
             probability_of_event=1.0, noise_velocity=0.0,
-            dt=0.0, mode="prior", diag={"init": True, "weight": 1.0},
+            dt=0.0, mode="prior",
+            diag={"init": True, "weight": 1.0, "measurement_var": var,
+                  "effective_innovation_var": var},
         )
 
     def step(self, obs: Observation) -> PosteriorSummary:
@@ -100,13 +135,13 @@ class CoreFilter:
         dt_raw = float(obs.t) - float(self.t_last)
         if dt_raw < -1e-6:
             raise ValueError("observations must be time ordered")
-        dt = max(dt_raw, 1e-3)
+        dt = max(dt_raw, 1e-6)
         self.t_last = max(float(obs.t), float(self.t_last))
 
-        Q = self.process_noise.Q(dt, self.x, tau=self.tau, q_acc=self.q_acc)
-        x_pred, P_pred = self.state_model.predict(self.x, self.P, dt, Q, tau=self.tau)
+        Q = self.process_noise.Q(dt)
+        x_pred, P_pred = self.state_model.predict(self.x, self.P, dt, Q)
         x_post, P_post, aux = self.updater.update(
-            x_pred, P_pred, obs, dt, self.state_model, self.noise_model
+            x_pred, P_pred, obs, dt, self.state_model
         )
         self.x, self.P = x_post, P_post
         self.mode = "tracking"

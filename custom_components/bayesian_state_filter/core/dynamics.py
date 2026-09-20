@@ -75,6 +75,45 @@ class DynamicsBank:
         self._last_event_t = float(t0)
         self._ready = True
 
+
+    def dump_state(self) -> dict:
+        """Serialize the complete model-bank state for restart-continuous learning."""
+        data = {
+            "tau_grid": self.tau_grid.tolist(),
+            "q_factors": self.q_factors.tolist(),
+            "nu": float(self.nu),
+            "samples": int(self.samples),
+            "forget_time_s": self.forget_time_s,
+            "last_event_t": self._last_event_t,
+            "ready": bool(self._ready),
+        }
+        if self._ready:
+            for name in ("_tau", "_q", "_x0", "_x1", "_p00", "_p01", "_p11", "_t", "_logw"):
+                data[name[1:]] = getattr(self, name).tolist()
+        return data
+
+    @classmethod
+    def load_state(cls, data: dict | None):
+        """Restore a model bank saved by :meth:`dump_state`."""
+        if not data:
+            return None
+        try:
+            obj = cls(
+                data.get("tau_grid", []),
+                q_factors=data.get("q_factors", (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0, 100.0)),
+                nu=float(data.get("nu", 4.0)),
+            )
+            obj.samples = int(data.get("samples", 0))
+            obj.forget_time_s = data.get("forget_time_s")
+            obj._last_event_t = data.get("last_event_t")
+            obj._ready = bool(data.get("ready", False))
+            if obj._ready:
+                for name in ("tau", "q", "x0", "x1", "p00", "p01", "p11", "t", "logw"):
+                    setattr(obj, "_" + name, np.asarray(data[name], dtype=float))
+            return obj
+        except Exception:
+            return None
+
     def _q_terms(self, dt):
         """Exact OU-velocity process covariance, vectorized by hypothesis."""
         dt = np.maximum(dt, 1e-9)
