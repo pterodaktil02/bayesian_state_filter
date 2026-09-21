@@ -279,3 +279,49 @@ def test_startup_evidence_expires_after_one_full_window():
 
     assert len(combined) == 1
     assert combined[0][2] == 0.50
+
+
+def test_startup_bias_gauge_is_median_zero():
+    rng = np.random.default_rng(20260921)
+    times = np.arange(0.0, 4 * 3600.0, 20.0)
+    latent = 1000.0 + 0.2 * np.sin(times / 1200.0)
+    offsets = {"a": -0.35, "b": -0.10, "c": 0.22, "d": 0.61}
+    histories = {
+        src: list(zip(times, latent + bias + rng.normal(0.0, 0.02, len(times))))
+        for src, bias in offsets.items()
+    }
+
+    result = calibrate_history(histories, tau_points=8)
+    biases = sorted(c.bias for c in result.sources.values())
+    median_bias = 0.5 * (biases[1] + biases[2])
+
+    assert abs(median_bias) < 1e-12
+
+
+def test_live_bias_gauge_cannot_drift_as_common_mode():
+    calibrations = {
+        "a": SourceCalibration(bias=-0.30, sigma=0.05, median_dt=1.0),
+        "b": SourceCalibration(bias=-0.10, sigma=0.05, median_dt=1.0),
+        "c": SourceCalibration(bias=0.10, sigma=0.05, median_dt=1.0),
+        "d": SourceCalibration(bias=0.30, sigma=0.05, median_dt=1.0),
+    }
+    cal = OnlineSourceCalibrator(calibrations, calibration_window_s=3600.0)
+
+    # Seed enough snapshots for live bias adaptation.  A common raw offset must
+    # not become a common bias offset because that mode is unidentifiable.
+    for n in range(20):
+        t = float(n)
+        values = {
+            "a": 1000.0 - 0.30 + 0.05,
+            "b": 1000.0 - 0.10 + 0.05,
+            "c": 1000.0 + 0.10 + 0.05,
+            "d": 1000.0 + 0.30 + 0.05,
+        }
+        for src, value in values.items():
+            cal.ensure_source(src, value, t)
+        cal.update_snapshot(t, tau=60.0, updated_source="a")
+
+    biases = sorted(c.bias for c in calibrations.values())
+    median_bias = 0.5 * (biases[1] + biases[2])
+
+    assert abs(median_bias) < 1e-12
