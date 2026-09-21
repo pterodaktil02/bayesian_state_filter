@@ -325,3 +325,57 @@ def test_live_bias_gauge_cannot_drift_as_common_mode():
     median_bias = 0.5 * (biases[1] + biases[2])
 
     assert abs(median_bias) < 1e-12
+
+
+def test_bias_gauge_preserves_pairwise_bias_differences_and_shifts_corrected_level_consistently():
+    calibrations = {
+        "a": SourceCalibration(bias=-0.15, sigma=0.05),
+        "b": SourceCalibration(bias=0.05, sigma=0.05),
+        "c": SourceCalibration(bias=0.25, sigma=0.05),
+        "d": SourceCalibration(bias=0.45, sigma=0.05),
+    }
+    raws = {"a": 1000.0, "b": 1000.2, "c": 1000.4, "d": 1000.6}
+    old_pairs = {
+        (a, b): calibrations[a].bias - calibrations[b].bias
+        for a in calibrations for b in calibrations if a < b
+    }
+    old_corrected = sorted(raws[s] - calibrations[s].bias for s in calibrations)
+    old_center = 0.5 * (old_corrected[1] + old_corrected[2])
+
+    cal = OnlineSourceCalibrator(calibrations)
+    gauge = cal.normalize_bias_gauge()
+
+    new_pairs = {
+        (a, b): calibrations[a].bias - calibrations[b].bias
+        for a in calibrations for b in calibrations if a < b
+    }
+    new_corrected = sorted(raws[s] - calibrations[s].bias for s in calibrations)
+    new_center = 0.5 * (new_corrected[1] + new_corrected[2])
+
+    for key in old_pairs:
+        assert math.isclose(old_pairs[key], new_pairs[key], rel_tol=0.0, abs_tol=1e-15)
+    assert math.isclose(new_center, old_center + gauge, rel_tol=0.0, abs_tol=1e-12)
+
+
+def test_checkpoint_gauge_migration_formula_keeps_level_in_same_corrected_coordinate_system():
+    calibrations = {
+        "a": SourceCalibration(bias=-0.10, sigma=0.05),
+        "b": SourceCalibration(bias=0.10, sigma=0.05),
+        "c": SourceCalibration(bias=0.30, sigma=0.05),
+        "d": SourceCalibration(bias=0.50, sigma=0.05),
+    }
+    raw = {"a": 990.0, "b": 990.2, "c": 990.4, "d": 990.6}
+    old_corrected = sorted(raw[s] - calibrations[s].bias for s in calibrations)
+    old_center = 0.5 * (old_corrected[1] + old_corrected[2])
+    old_state_level = old_center
+    old_history = [(1.0, old_center - 0.2, 0.01), (2.0, old_center, 0.01)]
+
+    cal = OnlineSourceCalibrator(calibrations)
+    gauge = cal.normalize_bias_gauge()
+    migrated_state_level = old_state_level + gauge
+    migrated_history = [(t, z + gauge, var) for t, z, var in old_history]
+
+    new_corrected = sorted(raw[s] - calibrations[s].bias for s in calibrations)
+    new_center = 0.5 * (new_corrected[1] + new_corrected[2])
+    assert math.isclose(migrated_state_level, new_center, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(migrated_history[-1][1], new_center, rel_tol=0.0, abs_tol=1e-12)
