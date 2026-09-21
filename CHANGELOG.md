@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 - 2026-09-21
+
+- Fixed the unidentifiable common bias mode by enforcing `median(bias_i) = 0`.
+- Applied the same gauge at startup and during live source calibration.
+- Kept live residual history in the same gauge after re-anchoring.
+- Added migration for 0.3.1 checkpoints: stored level and level-history are shifted consistently instead of forcing a full retrain.
+- Added regression tests preventing common-mode bias drift.
+
 ## 0.3.1 - 2026-09-20
 
 ### Added
