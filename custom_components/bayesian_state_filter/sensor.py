@@ -65,7 +65,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class BayesianEnsembleSensor(SensorEntity):
-    """Bayesian State Filter 0.3.0.
+    """Bayesian State Filter 0.3.2.
 
     Backward-compatible YAML platform.  The implementation is intentionally
     source-aware: raw observations are never collapsed into one irreversible
@@ -190,7 +190,7 @@ class BayesianEnsembleSensor(SensorEntity):
             try:
                 await self._initialize()
             except Exception:
-                _LOGGER.exception("Bayesian State Filter 0.3.0 initialization failed")
+                _LOGGER.exception("Bayesian State Filter 0.3.2 initialization failed")
                 await self._restore_fallback()
             self._seed_current_sources()
             self._ready = True
@@ -223,7 +223,7 @@ class BayesianEnsembleSensor(SensorEntity):
                 self._state = round(float(self.filter.x[0]), 6)
                 self._build_attrs(last_out=None)
             _LOGGER.info(
-                "Bayesian State Filter 0.3.0 restored checkpoint and caught up incrementally; t=%.3f",
+                "Bayesian State Filter 0.3.2 restored checkpoint and caught up incrementally; t=%.3f",
                 float(self.filter.t_last or 0.0),
             )
             return
@@ -300,7 +300,7 @@ class BayesianEnsembleSensor(SensorEntity):
             self._build_attrs(last_out=None)
             await self._save_state()
             _LOGGER.info(
-                "Bayesian State Filter 0.3.1 trained from %.2f d: gated_tau=%s q=%s "
+                "Bayesian State Filter 0.3.2 trained from %.2f d: gated_tau=%s q=%s "
                 "local_rmse=%s characteristic_time=%s (status=%s, conf=%.3f)",
                 result.history_span / 86400.0,
                 (f"{self.filter.tau:.1f} s" if self._gated_dynamics is not None else "fallback"),
@@ -770,6 +770,15 @@ class BayesianEnsembleSensor(SensorEntity):
             self._source_cal = OnlineSourceCalibrator.load_compact(
                 saved.get("source_calibrator"), self._calibrations
             )
+
+            # v0.3.1 checkpoints may contain a free common bias offset because
+            # pairwise calibration cannot identify the absolute bias gauge.
+            # Normalize it on restore and move the latent level/history by the
+            # same signed amount.  Derivatives and covariance are unchanged.
+            gauge_shift = self._source_cal.normalize_bias_gauge()
+            if abs(gauge_shift) > 1e-15:
+                self.filter.x[0] += gauge_shift
+
             self._dynamics_bank = None
             self._dynamics = None
             self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
@@ -780,6 +789,10 @@ class BayesianEnsembleSensor(SensorEntity):
             for row in saved.get("level_history", []) or []:
                 if len(row) >= 3:
                     level_history.append((float(row[0]), float(row[1]), float(row[2])))
+            if abs(gauge_shift) > 1e-15:
+                level_history = [
+                    (t, z + gauge_shift, var) for t, z, var in level_history
+                ]
             self._level_history = deque(level_history[-20000:], maxlen=20000)
             self._last_characteristic_fit_ts = float(saved.get("last_characteristic_fit_ts", 0.0) or 0.0)
             self._last_processed_by_source = {
@@ -808,6 +821,9 @@ class BayesianEnsembleSensor(SensorEntity):
         self._source_cal = OnlineSourceCalibrator.load_compact(
             saved.get("source_calibrator"), self._calibrations
         )
+        gauge_shift = self._source_cal.normalize_bias_gauge()
+        if abs(gauge_shift) > 1e-15 and self.filter.t_last is not None:
+            self.filter.x[0] += gauge_shift
         self._dynamics = None
         self._dynamics_bank = None
         self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
@@ -828,6 +844,8 @@ class BayesianEnsembleSensor(SensorEntity):
             except Exception:
                 continue
         if rows:
+            if abs(gauge_shift) > 1e-15:
+                rows = [(t, z + gauge_shift, var) for t, z, var in rows]
             self._level_history = deque(rows[-20000:], maxlen=20000)
         self._last_processed_by_source = {
             str(k): float(v) for k, v in (saved.get("last_processed_by_source", {}) or {}).items()
