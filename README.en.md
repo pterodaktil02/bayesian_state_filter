@@ -1,6 +1,6 @@
 # Bayesian State Filter for Home Assistant
 
-Version: **0.3.1**
+Version: **0.3.2**
 
 [Русское описание](README.md)
 
@@ -20,6 +20,25 @@ Instead of simple averaging, it jointly estimates:
 Typical use cases include temperature, pressure, humidity, radiation background and other continuous or quasi-continuous quantities measured by several sources in compatible units.
 
 > This is unrelated to Home Assistant's built-in `bayesian` integration, which estimates event probability and produces a binary sensor. This project estimates a continuous numeric state.
+
+## What changed in 0.3.2
+
+Fixed the unidentifiable common mode of source `bias` calibration. Pairwise
+calibration determines only bias differences, so without an explicit gauge all
+source biases could drift together by the same constant and move the absolute
+ensemble level without changing any cross-sensor residual.
+
+Startup and live calibration now enforce:
+
+```text
+median(bias_i) = 0
+```
+
+This matches the robust median fusion used by the filter: relative source
+corrections are preserved, while the common bias zero point can no longer
+wander. Existing 0.3.1 checkpoints are migrated without a full retrain: the
+common bias offset is removed and the stored level plus level-history are
+shifted by the same amount.
 
 ## What changed in 0.3.1
 
