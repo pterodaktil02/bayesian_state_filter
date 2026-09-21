@@ -319,6 +319,47 @@ def _solve_source_variances(calib, rows):
         x = x_new
     return {src: float(x[index[src]]) for src in sources}
 
+def _normalize_bias_gauge(calibrations, residuals=None):
+    """Anchor relative source biases to a unique, robust zero point.
+
+    Pairwise/source-residual calibration identifies only bias differences.
+    Without an explicit gauge all biases can drift together by an arbitrary
+    constant, shifting the absolute ensemble level while leaving every
+    pairwise residual unchanged.
+
+    The filter fuses sources by a robust median, so use the matching gauge:
+
+        median(bias_i) = 0
+
+    If live residual deques are supplied they are shifted by the same amount
+    so their stored targets stay in the new gauge.
+
+    Returns the removed common offset.  Corrected measurements would move by
+    the same signed amount.
+    """
+    finite = [
+        float(c.bias)
+        for c in calibrations.values()
+        if math.isfinite(float(c.bias))
+    ]
+    if not finite:
+        return 0.0
+    gauge = float(_median(finite, 0.0))
+    if not math.isfinite(gauge) or abs(gauge) <= 1e-15:
+        return 0.0
+
+    for c in calibrations.values():
+        if math.isfinite(float(c.bias)):
+            c.bias = float(c.bias) - gauge
+
+    if residuals is not None:
+        for src, dq in list(residuals.items()):
+            if dq:
+                residuals[src] = deque((float(t), float(v) - gauge) for t, v in dq)
+
+    return gauge
+
+
 def _make_grid(histories, step, freshness):
     starts = [s[0][0] for s in histories.values() if s]
     ends = [s[-1][0] for s in histories.values() if s]
@@ -516,6 +557,10 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
             typical_abs_level=max(float(level_scale), 1e-9), samples=len(seq),
         )
 
+    # Bias is identifiable only up to a common additive constant.  Anchor the
+    # startup solution to the same robust centre used by source fusion.
+    _normalize_bias_gauge(calib)
+
     # Pass 2a: provisional fusion using the long-history calibration.  The
     # long history is excellent for relative bias, but its spatial residual
     # spread can be badly inflated by old operating regimes, spatial thermal
@@ -700,6 +745,10 @@ class OnlineSourceCalibrator:
     def _pair_key(a: str, b: str):
         return (a, b) if a < b else (b, a)
 
+    def normalize_bias_gauge(self) -> float:
+        """Enforce median(source bias) == 0 and keep residual history aligned."""
+        return _normalize_bias_gauge(self.calibrations, self.residuals)
+
     def _record_close_pairs(self, now: float, tau: float, updated_source: str):
         if updated_source not in self.cache:
             return False
@@ -856,7 +905,7 @@ class OnlineSourceCalibrator:
 
     def update_snapshot(self, now: float, tau: float, updated_source: str | None = None):
         if len(self.cache) < 2:
-            return
+            return 0.0
         if self._online_start_time is None:
             self._online_start_time = float(now)
         fresh = {}
@@ -866,7 +915,7 @@ class OnlineSourceCalibrator:
             if now - t <= max_age:
                 fresh[src] = z
         if len(fresh) < 2:
-            return
+            return 0.0
 
         corrected = [z - self.calibrations[src].bias for src, z in fresh.items()]
         ref = _median(corrected)
@@ -896,9 +945,15 @@ class OnlineSourceCalibrator:
                 alpha = min(0.05, max(c.median_dt / max(window, 1.0), 0.005))
                 c.bias = (1.0 - alpha) * c.bias + alpha * b
 
+        # Relative biases have one unconstrained common mode.  Re-anchor that
+        # mode after every live update so the absolute ensemble cannot drift
+        # away from the raw robust centre while pairwise differences remain
+        # unchanged.
+        gauge_shift = self.normalize_bias_gauge()
+
         src_now = updated_source or self._last_updated_source
         if not src_now or not self._record_close_pairs(now, tau, src_now):
-            return
+            return gauge_shift
 
         live_rows, live_counts, live_spans = self._pair_rows_live(now, window)
         live_pair_counts = {src: 0 for src in self.calibrations}
@@ -913,7 +968,7 @@ class OnlineSourceCalibrator:
         rows = self._combine_startup_and_live_rows(live_rows, now=now, window=window)
         solved = _solve_source_variances(self.calibrations, rows)
         if not solved:
-            return
+            return gauge_shift
 
         counts, spans, pair_counts = self._combined_source_evidence(
             live_counts, live_spans, rows, now=now, window=window
@@ -929,4 +984,6 @@ class OnlineSourceCalibrator:
             c.calibration_samples = int(counts.get(src, 0))
             c.calibration_span = float(spans.get(src, 0.0))
             c.calibration_pairs = int(pair_counts.get(src, 0))
+
+        return gauge_shift
 
