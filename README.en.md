@@ -13,11 +13,11 @@ Instead of simple averaging, it jointly estimates:
 - acceleration;
 - jerk;
 - relative bias of each source;
-- effective observation sigma of each source;
+- effective observation standard deviation (`sigma`) of each source;
 - confidence in each incoming measurement;
 - confidence in the derivative terms of the dynamic model.
 
-Typical use cases include temperature, pressure, humidity, radiation background and other continuous or quasi-continuous quantities measured by several sources in compatible units.
+Typical use cases include temperature, pressure, humidity, background radiation, and other continuous or quasi-continuous quantities measured by several sources in compatible units.
 
 > This is unrelated to Home Assistant's built-in `bayesian` integration, which estimates event probability and produces a binary sensor. This project estimates a continuous numeric state.
 
@@ -31,7 +31,7 @@ The state is always:
 
 where `x` is level, `v` is rate, `a` is acceleration and `j` is jerk.
 
-The model uses an integrated Wiener process driven by snap noise. The same confidence-gated transition matrix is used for both the state mean and covariance. This prevents poorly observed hidden derivatives from destabilizing the covariance through ungated cross-couplings.
+The model uses an integrated Wiener process driven by snap noise. The same confidence-gated transition matrix is applied to both the state mean and covariance. This prevents poorly observed hidden derivatives from destabilizing the covariance through ungated cross-couplings.
 
 ### Derivative confidence
 
@@ -67,21 +67,21 @@ If rate is not confidently observed, acceleration and jerk cannot have stronger 
 
 Each incoming measurement updates the common state independently; sources are not averaged before the Bayesian update.
 
-For every source the integration estimates:
+For every source, the integration estimates:
 
 - relative `bias`;
-- effective `sigma`;
-- typical update cadence;
-- innovation;
+- effective observation standard deviation `sigma`;
+- typical update interval;
+- innovation (measurement residual);
 - innovation z-score;
 - Student-t robust weight;
 - outlier statistics.
 
-The Student-t updater may assign a weight slightly above 1 to a well-aligned inlier and smoothly downweights outliers.
+The Student-t updater may assign a weight slightly above 1 to a well-aligned inlier and smoothly downweight outliers.
 
 ### Dynamics identification
 
-`q/timescale` are identified from Recorder history on the natural process cadence. Validation uses 1-2 natural process steps instead of an arbitrary long forecast horizon.
+`q/timescale` are identified from Recorder history on the process's natural time grid. Validation uses 1-2 natural process steps instead of an arbitrary long forecast horizon.
 
 RMSE is a diagnostic of the fitted dynamics, not a definition of derivative confidence. Confidence is derived only from the posterior state and covariance.
 
@@ -120,7 +120,7 @@ Three common-bias gauges are available through `bias_anchor`:
 
 - `median` - robust relative zero gauge;
 - `mean` - linear sum-to-zero gauge;
-- `passport` - absolute anchoring from model datasheet accuracy, with one robust vote per model family regardless of the number of identical physical sensors.
+- `passport` - an absolute prior-based anchor derived from model datasheet accuracy, with one robust vote per model family regardless of the number of identical physical sensors.
 
 ## Installation
 
@@ -192,9 +192,39 @@ Main options:
 | `student_nu` | `4` | Student-t degrees of freedom |
 | `characteristic_refit_s` | `21600` | Refitting interval for the slow level characteristic time |
 | `warmup_refit_s` | `21600` | Minimum retry interval for dynamics warmup while it is still unidentified |
-| `bias_anchor` | `median` | Common-bias gauge: `median`, `mean` or `passport` |
+| `bias_anchor` | `median` | Common-bias anchor: `median`, `mean` or `passport` |
 | `noise_model` | `auto` | `auto`, `gaussian` or `poisson` |
 | `diagnostics` | `compact` | `compact`, `full`, `debug`, `verbose` |
+
+### `passport` anchoring example
+
+When `bias_anchor: passport` is used, sources that participate in the absolute anchor must declare a model, and that model must provide `absolute_accuracy`:
+
+```yaml
+sensor:
+  - platform: bayesian_state_filter
+    name: "Pressure ensemble"
+
+    ensemble:
+      sources:
+        - entity_id: sensor.pressure_1
+          model: bmp280_pressure
+        - entity_id: sensor.pressure_2
+          model: bmp280_pressure
+        - entity_id: sensor.pressure_3
+          model: bmp390_pressure
+
+      models:
+        bmp280_pressure:
+          absolute_accuracy: 1.0
+        bmp390_pressure:
+          absolute_accuracy: 0.5
+
+    bayes:
+      bias_anchor: passport
+```
+
+Multiple sensors of the same model do not create multiple independent absolute-reference votes; the model family contributes one robust vote.
 
 ## Main attributes
 
@@ -220,7 +250,7 @@ gated_local_rmse_step1
 gated_local_rmse_step2
 ```
 
-Rate, curvature and jerk are exposed in per-hour units for readability, while the internal state uses per-second time units.
+Rate, curvature, and jerk are exposed in per-hour units for readability, while the internal state uses per-second time units.
 
 Per-source diagnostics are available under `source_health`:
 
@@ -238,8 +268,8 @@ robust_weight
 
 ## Practical notes
 
-- `bias` is relative; without an external reference the filter cannot determine a systematic error shared by all sources.
-- `sigma` is the effective observation error with respect to the latent state, not the sensor datasheet accuracy.
+- With `median` or `mean` anchoring, `bias` is relative: a systematic error shared by all sources is not identifiable from the ensemble alone. `passport` adds an absolute prior from model datasheet accuracy, but it is still a prior, not a physical reference standard.
+- `sigma` is the effective observation standard deviation with respect to the latent state, not the sensor datasheet accuracy.
 - A high `robust_weight` indicates an inlier; a low one indicates an outlier or temporary disagreement with the common process.
 - Large `curvature_per_hour2` or `jerk_per_hour3` values alone are not necessarily problematic because local derivatives are rescaled from seconds to hours. Inspect them together with derivative weights and local RMSE.
 - When dynamics are not identifiable above the noise floor, derivative weights should collapse toward zero and the model naturally behaves as a level estimator.
