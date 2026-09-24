@@ -997,7 +997,8 @@ class OnlineSourceCalibrator:
             rows.append((sa, sb, ps * ps, n, span))
             counts[sa] += n
             counts[sb] += n
-            spans[sa] = max(spans[sa], span)            spans[sb] = max(spans[sb], span)
+            spans[sa] = max(spans[sa], span)
+            spans[sb] = max(spans[sb], span)
         return rows, counts, spans
 
     def _combine_startup_and_live_rows(self, live_rows, *, now: float, window: float):

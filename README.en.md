@@ -1,6 +1,6 @@
 # Bayesian State Filter for Home Assistant
 
-Version: **0.3.2**
+Version: **0.4.0**
 
 [Русское описание](README.md)
 
@@ -20,6 +20,44 @@ Instead of simple averaging, it jointly estimates:
 Typical use cases include temperature, pressure, humidity, radiation background and other continuous or quasi-continuous quantities measured by several sources in compatible units.
 
 > This is unrelated to Home Assistant's built-in `bayesian` integration, which estimates event probability and produces a binary sensor. This project estimates a continuous numeric state.
+
+## What changed in 0.4.0
+
+The main 0.4.0 change is a hot-path performance fix in online source
+calibration. Previously, every incoming observation could trigger a
+`bias/sigma` re-estimation over a growing history window. With fast sources
+this turned an almost unchanged metrology estimate into an O(history)
+operation on every sample and could eventually consume the Home Assistant
+event-loop CPU.
+
+Each sample now performs only the normal filter update plus a cheap O(1)
+drift monitor. The full O(history) calibration pass is scheduled adaptively:
+
+```text
+stable   -> approximately once per calibration_window / 2
+watch    -> more often when drift becomes noticeable
+unstable -> more often again under clear degradation
+```
+
+Drift is evaluated relative to each source's own established outlier baseline,
+so a sensor that normally sits around a 4% outlier rate is not permanently
+classified as suspicious merely for exceeding a global fixed threshold.
+
+Adaptive scheduler state is persisted in the checkpoint. A normal restart from
+a compatible checkpoint neither repeats the full multi-day bootstrap nor
+forces an immediate heavy refit.
+
+`source_health` was also reduced to compact runtime fields so a large nested
+diagnostic payload is not serialized on every sensor update. Detailed CPU and
+background-work diagnostics are exposed separately under `cpu_diag_*`.
+
+0.4.0 also adds `bias_anchor`:
+
+- `median` - the previous robust zero gauge;
+- `mean` - a linear sum-to-zero gauge;
+- `passport` - an absolute anchor from model datasheet accuracy, with one
+  robust vote per model family regardless of how many identical physical
+  sensors are present.
 
 ## What changed in 0.3.2
 
@@ -199,7 +237,9 @@ Main options:
 | `history_days` | `7` | Recorder history used for startup calibration and dynamics identification |
 | `save_every_s` | `1800` | Checkpoint interval |
 | `student_nu` | `4` | Student-t degrees of freedom |
-| `characteristic_refit_s` | `1800` | Refitting interval for the slow level characteristic time |
+| `characteristic_refit_s` | `21600` | Refitting interval for the slow level characteristic time |
+| `warmup_refit_s` | `21600` | Minimum retry interval for dynamics warmup while it is still unidentified |
+| `bias_anchor` | `median` | Common-bias gauge: `median`, `mean` or `passport` |
 | `noise_model` | `auto` | `auto`, `gaussian` or `poisson` |
 | `diagnostics` | `compact` | `compact`, `full`, `debug`, `verbose` |
 
@@ -232,16 +272,13 @@ Rate, curvature and jerk are exposed in per-hour units for readability, while th
 Per-source diagnostics are available under `source_health`:
 
 ```text
+model
 bias
 sigma
 median_dt_s
-outliers
 outlier_rate
-last_raw_value
-last_corrected_value
-last_innovation
 last_z_score
-last_robust_weight
+robust_weight
 ```
 
 `characteristic_time_s` remains a separate slow-timescale estimate of the level process. It is not expected to match `gated_timescale_s`, which belongs to the local state-space model.

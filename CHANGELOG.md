@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0 - 2026-09-24
+
+### Performance
+- Removed the O(history) source recalibration pass from the per-sample hot path.
+- Added a cheap O(1) innovation/drift monitor and adaptive heavy-refit scheduling.
+- Stable sources now refit at roughly half the calibration window; suspicious or unstable sources refit more often.
+- Drift detection is relative to each source's established outlier baseline, avoiding false `watch` mode for naturally noisier sensors.
+- Bounded retained level history and reduced hot-path `source_health` payload to lower Home Assistant state/serialization overhead.
+
+### Persistence and diagnostics
+- Persisted adaptive calibration scheduler state in checkpoints.
+- Restoring an older compatible checkpoint seeds the refit timestamp from the checkpoint time instead of forcing an immediate heavy refit.
+- Added CPU/background diagnostics for calibration, warmup, characteristic-time fitting and checkpoint saves.
+
+### Calibration
+- Added configurable bias anchoring: `median`, `mean`, and `passport`.
+- `passport` uses one robust vote per sensor model weighted by configured absolute accuracy, avoiding duplicate sensors of one model counting as independent absolute references.
+- Checkpoint compatibility now includes source/model mapping and bias-anchor semantics.
+
 ## 0.3.2 - 2026-09-21
 
 - Fixed the unidentifiable common bias mode by enforcing `median(bias_i) = 0`.
