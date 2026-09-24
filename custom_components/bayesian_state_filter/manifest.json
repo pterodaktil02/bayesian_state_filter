@@ -1,7 +1,7 @@
 {
   "domain": "bayesian_state_filter",
   "name": "Bayesian State Filter",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "requirements": [
     "numpy>=1.26.0,<3.0.0"
   ],

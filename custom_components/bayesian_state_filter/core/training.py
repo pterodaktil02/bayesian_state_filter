@@ -7,6 +7,7 @@ from bisect import bisect_right
 from collections import deque
 import math
 import statistics
+import time
 import numpy as np
 
 from .dynamics import DynamicsBank, DynamicsEstimate
@@ -104,6 +105,136 @@ class TrainingResult:
     # a generic 150k computational ceiling.  Kept separate from the
     # hold-last-value grid used by source calibration/characteristic-time work.
     dynamics_points: list[tuple[float, float, float]] | None = None
+
+
+@dataclass
+class BiasAnchorResult:
+    """Diagnostics for the gauge chosen for relative source biases."""
+    mode: str
+    shift: float
+    model_centers: dict[str, float] | None = None
+    model_weights: dict[str, float] | None = None
+
+
+def _huber_psi(u: float, delta: float = 1.345) -> float:
+    u = float(u)
+    d = max(float(delta), 1e-9)
+    return max(-d, min(d, u))
+
+
+def _passport_anchor_center(calibrations, source_models, model_accuracy, *, huber_delta=1.345):
+    """Return a robust absolute-bias gauge from device-model accuracy priors.
+
+    Each device model contributes one family-level center, regardless of how
+    many physical sensors of that model are present.  This prevents ten
+    identical sensors from becoming ten independent votes about absolute
+    accuracy when their datasheet systematic error is shared.
+
+    The family centers are combined with a heteroscedastic Huber M-estimator:
+
+        sum_f psi((m_f - g) / a_f) / a_f = 0
+
+    where m_f is the robust median bias of the model family and a_f is the
+    configured datasheet absolute-accuracy scale.
+    """
+    source_models = source_models or {}
+    model_accuracy = model_accuracy or {}
+    grouped = {}
+    for src, cal in calibrations.items():
+        model = source_models.get(src)
+        if not model or model not in model_accuracy:
+            continue
+        try:
+            b = float(cal.bias)
+            a = float(model_accuracy[model])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(b) and math.isfinite(a) and a > 0:
+            grouped.setdefault(str(model), []).append(b)
+    if not grouped:
+        return None, {}, {}
+
+    centers = {model: _median(vals) for model, vals in grouped.items()}
+    scales = {model: float(model_accuracy[model]) for model in centers}
+    if len(centers) == 1:
+        model = next(iter(centers))
+        return centers[model], centers, {model: 1.0 / (scales[model] ** 2)}
+
+    # The score is monotone decreasing in g, so bisection gives the unique
+    # minimizer of the convex Huber objective without an arbitrary optimizer.
+    max_scale = max(scales.values())
+    lo = min(centers.values()) - 20.0 * max_scale
+    hi = max(centers.values()) + 20.0 * max_scale
+
+    def score(g):
+        total = 0.0
+        for model, m in centers.items():
+            a = scales[model]
+            total += _huber_psi((m - g) / a, huber_delta) / a
+        return total
+
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if score(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    g = 0.5 * (lo + hi)
+
+    weights = {}
+    for model, m in centers.items():
+        a = scales[model]
+        u = (m - g) / a
+        robust = 1.0 if abs(u) <= huber_delta else huber_delta / max(abs(u), 1e-12)
+        weights[model] = robust / (a * a)
+    return float(g), centers, weights
+
+
+def normalize_bias_gauge(calibrations, *, mode="median", source_models=None,
+                         model_accuracy=None, residuals=None, huber_delta=1.345):
+    """Remove the unidentifiable common bias mode.
+
+    ``median`` keeps v0.3.2 behavior. ``mean`` is a linear sum-to-zero gauge.
+    ``passport`` uses one robust family vote per configured device model,
+    scaled by that model's datasheet absolute accuracy.
+    """
+    mode = str(mode or "median").strip().lower()
+    finite = [float(c.bias) for c in calibrations.values()
+              if math.isfinite(float(c.bias))]
+    if not finite:
+        return BiasAnchorResult(mode=mode, shift=0.0)
+
+    model_centers = None
+    model_weights = None
+    if mode == "mean":
+        gauge = float(sum(finite) / len(finite))
+    elif mode == "passport":
+        gauge, model_centers, model_weights = _passport_anchor_center(
+            calibrations, source_models, model_accuracy, huber_delta=huber_delta
+        )
+        if gauge is None:
+            raise ValueError("passport bias anchor has no sources with valid model absolute_accuracy")
+    else:
+        mode = "median"
+        gauge = float(_median(finite, 0.0))
+
+    if not math.isfinite(gauge) or abs(gauge) <= 1e-15:
+        return BiasAnchorResult(mode=mode, shift=0.0,
+                                model_centers=model_centers, model_weights=model_weights)
+
+    for cal in calibrations.values():
+        if math.isfinite(float(cal.bias)):
+            cal.bias = float(cal.bias) - gauge
+
+    # Live residuals target source bias in the current gauge.  When corrected
+    # values move by +g, raw-minus-reference residuals move by -g.
+    if residuals is not None:
+        for src, dq in list(residuals.items()):
+            if dq:
+                residuals[src] = deque((float(t), float(v) - gauge) for t, v in dq)
+
+    return BiasAnchorResult(mode=mode, shift=float(gauge),
+                            model_centers=model_centers, model_weights=model_weights)
 
 
 def _clean_history(seq):
@@ -319,47 +450,6 @@ def _solve_source_variances(calib, rows):
         x = x_new
     return {src: float(x[index[src]]) for src in sources}
 
-def _normalize_bias_gauge(calibrations, residuals=None):
-    """Anchor relative source biases to a unique, robust zero point.
-
-    Pairwise/source-residual calibration identifies only bias differences.
-    Without an explicit gauge all biases can drift together by an arbitrary
-    constant, shifting the absolute ensemble level while leaving every
-    pairwise residual unchanged.
-
-    The filter fuses sources by a robust median, so use the matching gauge:
-
-        median(bias_i) = 0
-
-    If live residual deques are supplied they are shifted by the same amount
-    so their stored targets stay in the new gauge.
-
-    Returns the removed common offset.  Corrected measurements would move by
-    the same signed amount.
-    """
-    finite = [
-        float(c.bias)
-        for c in calibrations.values()
-        if math.isfinite(float(c.bias))
-    ]
-    if not finite:
-        return 0.0
-    gauge = float(_median(finite, 0.0))
-    if not math.isfinite(gauge) or abs(gauge) <= 1e-15:
-        return 0.0
-
-    for c in calibrations.values():
-        if math.isfinite(float(c.bias)):
-            c.bias = float(c.bias) - gauge
-
-    if residuals is not None:
-        for src, dq in list(residuals.items()):
-            if dq:
-                residuals[src] = deque((float(t), float(v) - gauge) for t, v in dq)
-
-    return gauge
-
-
 def _make_grid(histories, step, freshness):
     starts = [s[0][0] for s in histories.values() if s]
     ends = [s[-1][0] for s in histories.values() if s]
@@ -513,7 +603,9 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
                       tau_points: int = 16, forget_time_s: float | None = None,
                       tau_min_s: float | None = None, tau_max_s: float | None = None,
                       characteristic_tau_min_s: float | None = None,
-                      characteristic_tau_max_s: float | None = None) -> TrainingResult:
+                      characteristic_tau_max_s: float | None = None,
+                      bias_anchor: str = "median", source_models=None,
+                      model_accuracy=None, huber_delta: float = 1.345) -> TrainingResult:
     histories = {k: _clean_history(v) for k, v in histories.items()}
     histories = {k: v for k, v in histories.items() if v}
     if not histories:
@@ -557,9 +649,10 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
             typical_abs_level=max(float(level_scale), 1e-9), samples=len(seq),
         )
 
-    # Bias is identifiable only up to a common additive constant.  Anchor the
-    # startup solution to the same robust centre used by source fusion.
-    _normalize_bias_gauge(calib)
+    normalize_bias_gauge(
+        calib, mode=bias_anchor, source_models=source_models,
+        model_accuracy=model_accuracy, huber_delta=huber_delta,
+    )
 
     # Pass 2a: provisional fusion using the long-history calibration.  The
     # long history is excellent for relative bias, but its spatial residual
@@ -628,8 +721,15 @@ class OnlineSourceCalibrator:
     """
 
     def __init__(self, calibrations: dict[str, SourceCalibration], *,
-                 startup_pair_rows=None, calibration_window_s: float | None = None):
+                 startup_pair_rows=None, calibration_window_s: float | None = None,
+                 bias_anchor: str = "median", source_models=None, model_accuracy=None,
+                 huber_delta: float = 1.345):
         self.calibrations = calibrations
+        self.bias_anchor = str(bias_anchor or "median").strip().lower()
+        self.source_models = dict(source_models or {})
+        self.model_accuracy = {str(k): float(v) for k, v in (model_accuracy or {}).items()}
+        self.huber_delta = float(huber_delta)
+        self.last_anchor = BiasAnchorResult(mode=self.bias_anchor, shift=0.0)
         self.cache = {}  # src -> (t, raw value)
         # Cross-source snapshot residuals are used only for relative bias.
         self.residuals = {src: deque() for src in calibrations}
@@ -658,6 +758,19 @@ class OnlineSourceCalibrator:
         self.live_calibration_pairs = {src: 0 for src in calibrations}
         self._last_updated_source: str | None = None
 
+        # Adaptive full-calibration scheduler. Every observation only updates
+        # cheap O(1) drift statistics; O(history) median/MAD/variance fitting
+        # is deferred to a scheduled refit.
+        self._last_refit_ts: float = 0.0
+        self._refit_runs: int = 0
+        self._refit_failures: int = 0
+        self._refit_last_ms: float = 0.0
+        self._refit_max_ms: float = 0.0
+        self._refit_last_points: int = 0
+        self._calibration_mode: str = "stable"
+        self._drift_score: float = 0.0
+        self._drift: dict[str, dict[str, float]] = {}
+
 
     def dump_compact(self, now: float, tau: float) -> dict:
         """Persist compact rolling calibration evidence.
@@ -681,16 +794,30 @@ class OnlineSourceCalibrator:
             "cache": {k: [float(v[0]), float(v[1])] for k, v in self.cache.items()},
             "last_updated_source": self._last_updated_source,
             "snapshot_time": float(now),
+            "last_refit_ts": float(self._last_refit_ts),
+            "refit_runs": int(self._refit_runs),
+            "refit_failures": int(self._refit_failures),
+            "refit_last_ms": float(self._refit_last_ms),
+            "refit_max_ms": float(self._refit_max_ms),
+            "refit_last_points": int(self._refit_last_points),
+            "calibration_mode": str(self._calibration_mode),
+            "drift_score": float(self._drift_score),
+            "drift": {k: dict(v) for k, v in self._drift.items()},
         }
 
     @classmethod
-    def load_compact(cls, data: dict | None, calibrations: dict[str, SourceCalibration]):
+    def load_compact(cls, data: dict | None, calibrations: dict[str, SourceCalibration], *,
+                     bias_anchor: str = "median", source_models=None, model_accuracy=None,
+                     huber_delta: float = 1.345):
         if not data:
-            return cls(calibrations)
+            return cls(calibrations, bias_anchor=bias_anchor, source_models=source_models,
+                       model_accuracy=model_accuracy, huber_delta=huber_delta)
         obj = cls(
             calibrations,
             startup_pair_rows=data.get("startup_pair_rows") or [],
             calibration_window_s=data.get("calibration_window_s"),
+            bias_anchor=bias_anchor, source_models=source_models,
+            model_accuracy=model_accuracy, huber_delta=huber_delta,
         )
         for src, pair in (data.get("cache") or {}).items():
             try:
@@ -706,6 +833,57 @@ class OnlineSourceCalibrator:
             obj._online_start_time = float(data.get("snapshot_time"))
         except (TypeError, ValueError):
             obj._online_start_time = None
+
+        try:
+            checkpoint_ts = float(data.get("snapshot_time", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            checkpoint_ts = 0.0
+        try:
+            obj._last_refit_ts = float(
+                data.get("last_refit_ts", checkpoint_ts) or checkpoint_ts
+            )
+        except (TypeError, ValueError):
+            obj._last_refit_ts = checkpoint_ts
+
+        obj._refit_runs = int(data.get("refit_runs", 0) or 0)
+        obj._refit_failures = int(data.get("refit_failures", 0) or 0)
+        obj._refit_last_ms = float(data.get("refit_last_ms", 0.0) or 0.0)
+        obj._refit_max_ms = float(data.get("refit_max_ms", 0.0) or 0.0)
+        obj._refit_last_points = int(data.get("refit_last_points", 0) or 0)
+        obj._calibration_mode = str(
+            data.get("calibration_mode", "stable") or "stable"
+        )
+        obj._drift_score = float(data.get("drift_score", 0.0) or 0.0)
+
+        raw_drift = data.get("drift") or {}
+        if isinstance(raw_drift, dict):
+            for src, row in raw_drift.items():
+                if src not in calibrations or not isinstance(row, dict):
+                    continue
+                try:
+                    baseline_outlier = min(
+                        max(
+                            float(
+                                row.get(
+                                    "outlier_baseline",
+                                    calibrations[src].outlier_rate,
+                                )
+                            ),
+                            0.0,
+                        ),
+                        0.5,
+                    )
+                    obj._drift[src] = {
+                        "abs_z": float(row.get("abs_z", 0.8)),
+                        "outlier": float(
+                            row.get("outlier", baseline_outlier)
+                        ),
+                        "outlier_baseline": baseline_outlier,
+                        "weight": float(row.get("weight", 1.0)),
+                        "last_t": float(row.get("last_t", checkpoint_ts)),
+                    }
+                except (TypeError, ValueError):
+                    continue
         return obj
 
     def seed_startup_evidence(self, rows, calibration_window_s: float | None = None):
@@ -738,6 +916,17 @@ class OnlineSourceCalibrator:
             self.live_calibration_samples[src] = 0
             self.live_calibration_span[src] = 0.0
             self.live_calibration_pairs[src] = 0
+        baseline_outlier = min(max(float(c.outlier_rate), 0.0), 0.5)
+        self._drift.setdefault(
+            src,
+            {
+                "abs_z": 0.8,
+                "outlier": baseline_outlier,
+                "outlier_baseline": baseline_outlier,
+                "weight": 1.0,
+                "last_t": float(t),
+            },
+        )
         self.cache[src] = (float(t), float(value))
         self._last_updated_source = src
 
@@ -745,9 +934,13 @@ class OnlineSourceCalibrator:
     def _pair_key(a: str, b: str):
         return (a, b) if a < b else (b, a)
 
-    def normalize_bias_gauge(self) -> float:
-        """Enforce median(source bias) == 0 and keep residual history aligned."""
-        return _normalize_bias_gauge(self.calibrations, self.residuals)
+    def normalize_bias_gauge(self):
+        self.last_anchor = normalize_bias_gauge(
+            self.calibrations, mode=self.bias_anchor,
+            source_models=self.source_models, model_accuracy=self.model_accuracy,
+            residuals=self.residuals, huber_delta=self.huber_delta,
+        )
+        return self.last_anchor
 
     def _record_close_pairs(self, now: float, tau: float, updated_source: str):
         if updated_source not in self.cache:
@@ -804,8 +997,7 @@ class OnlineSourceCalibrator:
             rows.append((sa, sb, ps * ps, n, span))
             counts[sa] += n
             counts[sb] += n
-            spans[sa] = max(spans[sa], span)
-            spans[sb] = max(spans[sb], span)
+            spans[sa] = max(spans[sa], span)            spans[sb] = max(spans[sb], span)
         return rows, counts, spans
 
     def _combine_startup_and_live_rows(self, live_rows, *, now: float, window: float):
@@ -903,11 +1095,166 @@ class OnlineSourceCalibrator:
                 spans[src] = live_span
         return counts, spans, pair_counts
 
-    def update_snapshot(self, now: float, tau: float, updated_source: str | None = None):
+    def observe_innovation(
+        self, src: str, t: float, z_score: float, weight: float = 1.0
+    ):
+        """Update cheap O(1) drift statistics for one source."""
+        if src not in self.calibrations:
+            return
+        try:
+            z = abs(float(z_score))
+            w = float(weight)
+            now = float(t)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(z) or not math.isfinite(w) or not math.isfinite(now):
+            return
+
+        c = self.calibrations[src]
+        baseline_outlier = min(max(float(c.outlier_rate), 0.0), 0.5)
+        d = self._drift.setdefault(
+            src,
+            {
+                "abs_z": 0.8,
+                "outlier": baseline_outlier,
+                "outlier_baseline": baseline_outlier,
+                "weight": 1.0,
+                "last_t": now,
+            },
+        )
+        last_t = float(d.get("last_t", now))
+        dt = max(now - last_t, 0.0)
+
+        # About 15 minutes effective memory. Sparse sources naturally receive
+        # larger updates when they finally report.
+        tau_ewma = 900.0
+        alpha = 1.0 - math.exp(-dt / tau_ewma) if dt > 0 else 0.02
+        alpha = min(max(alpha, 0.01), 0.35)
+
+        d["abs_z"] = (
+            (1.0 - alpha) * float(d.get("abs_z", 0.8)) + alpha * z
+        )
+        outlier = 1.0 if z > 3.0 or w < 0.25 else 0.0
+        d["outlier"] = (
+            (1.0 - alpha) * float(d.get("outlier", 0.0)) + alpha * outlier
+        )
+        d["weight"] = (
+            (1.0 - alpha) * float(d.get("weight", 1.0)) + alpha * w
+        )
+        d["last_t"] = now
+        self._update_drift_mode()
+
+    def _update_drift_mode(self):
+        score = 0.0
+        for d in self._drift.values():
+            abs_z = max(float(d.get("abs_z", 0.8)), 0.0)
+            outlier = min(max(float(d.get("outlier", 0.0)), 0.0), 1.0)
+            weight = min(max(float(d.get("weight", 1.0)), 0.0), 2.0)
+
+            # Correctly scaled Gaussian innovations have E|z| ~= 0.8.
+            z_term = max(abs_z - 1.0, 0.0) / 0.8
+            baseline_outlier = min(
+                max(float(d.get("outlier_baseline", 0.0)), 0.0), 0.5
+            )
+            # Drift means deterioration relative to this sensor's own normal
+            # outlier behaviour. A sensor that historically sits at 4% must
+            # not be permanently classified as WATCH merely for remaining at 4%.
+            outlier_excess = max(outlier - baseline_outlier, 0.0)
+            outlier_scale = max(0.03, baseline_outlier * 2.0)
+            outlier_term = outlier_excess / outlier_scale
+
+            weight_term = max(0.75 - weight, 0.0) / 0.50
+            score = max(score, z_term, outlier_term, weight_term)
+
+        self._drift_score = float(score)
+        old = self._calibration_mode
+
+        # Fast escalation, slower relaxation.
+        if old == "unstable":
+            if score < 0.7:
+                self._calibration_mode = "watch" if score >= 0.35 else "stable"
+        elif old == "watch":
+            if score >= 1.5:
+                self._calibration_mode = "unstable"
+            elif score < 0.35:
+                self._calibration_mode = "stable"
+        else:
+            if score >= 1.5:
+                self._calibration_mode = "unstable"
+            elif score >= 0.6:
+                self._calibration_mode = "watch"
+
+    def _refit_interval(self, window: float) -> float:
+        """Return adaptive heavy-refit cadence.
+
+        Stable has NO upper clamp: roughly two refits per calibration window.
+        Watch/unstable may accelerate, but remain guarded from rapid polling.
+        """
+        w = max(float(window), 1.0)
+        if self._calibration_mode == "unstable":
+            # Long windows may accelerate to at most once per 2 hours.
+            return max(min(w / 12.0, 7200.0), 900.0)
+        if self._calibration_mode == "watch":
+            # At most once per 6 hours while suspicious.
+            return max(min(w / 6.0, 21600.0), 1800.0)
+        # Stable: exactly the intended slow policy, about twice per window.
+        return max(w / 2.0, 3600.0)
+
+    def scheduler_diagnostics(self, now: float, tau: float) -> dict:
+        dynamic_window = max(
+            3.0 * float(tau),
+            10.0 * _median(
+                [c.median_dt for c in self.calibrations.values()], 60.0
+            ),
+            3600.0,
+        )
+        window = self.calibration_window_s or dynamic_window
+        interval = self._refit_interval(window)
+        age = (
+            max(float(now) - self._last_refit_ts, 0.0)
+            if self._last_refit_ts
+            else None
+        )
+        return {
+            "mode": self._calibration_mode,
+            "drift_score": float(self._drift_score),
+            "drift_sources": {
+                src: {
+                    "abs_z": round(float(d.get("abs_z", 0.0)), 3),
+                    "outlier": round(float(d.get("outlier", 0.0)), 4),
+                    "outlier_baseline": round(
+                        float(d.get("outlier_baseline", 0.0)), 4
+                    ),
+                    "weight": round(float(d.get("weight", 1.0)), 3),
+                }
+                for src, d in self._drift.items()
+            },
+            "window_s": float(window),
+            "interval_s": float(interval),
+            "last_refit_age_s": age,
+            "next_refit_due_s": (
+                0.0 if age is None else max(interval - age, 0.0)
+            ),
+            "refit_runs": int(self._refit_runs),
+            "refit_failures": int(self._refit_failures),
+            "refit_last_ms": float(self._refit_last_ms),
+            "refit_max_ms": float(self._refit_max_ms),
+            "refit_last_points": int(self._refit_last_points),
+            "residual_points": sum(len(dq) for dq in self.residuals.values()),
+            "pair_residual_points": sum(
+                len(dq) for dq in self.pair_residuals.values()
+            ),
+        }
+
+    def update_snapshot(
+        self, now: float, tau: float, updated_source: str | None = None
+    ):
+        """Accumulate evidence cheaply and run O(history) work only when due."""
         if len(self.cache) < 2:
-            return 0.0
+            return False
         if self._online_start_time is None:
             self._online_start_time = float(now)
+
         fresh = {}
         for src, (t, z) in self.cache.items():
             c = self.calibrations[src]
@@ -915,75 +1262,119 @@ class OnlineSourceCalibrator:
             if now - t <= max_age:
                 fresh[src] = z
         if len(fresh) < 2:
-            return 0.0
+            return False
 
-        corrected = [z - self.calibrations[src].bias for src, z in fresh.items()]
+        corrected = [
+            z - self.calibrations[src].bias for src, z in fresh.items()
+        ]
         ref = _median(corrected)
         dynamic_window = max(
             3.0 * tau,
-            10.0 * _median([self.calibrations[s].median_dt for s in fresh], 60.0),
+            10.0 * _median(
+                [self.calibrations[s].median_dt for s in fresh], 60.0
+            ),
             3600.0,
         )
-        # When startup history exists, keep the exact calibration horizon that
-        # produced startup sigma.  This makes restart/reload continuous.  With
-        # no startup history we retain the previous dynamic-window behavior.
         window = self.calibration_window_s or dynamic_window
         cutoff = now - window
 
-        # Bias remains a robust cross-source quantity.  Bias adaptation keeps
-        # its existing live-window behavior; the continuity fix in 0.2.1.7 is
-        # specifically for pairwise sigma evidence.
+        # Cheap accumulation only; no median/MAD over the whole window.
         for src, z in fresh.items():
             dq = self.residuals.setdefault(src, deque())
             dq.append((now, z - ref))
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
-            c = self.calibrations[src]
-            if len(dq) >= 8:
-                vals = [v for _, v in dq]
-                b = _median(vals)
-                alpha = min(0.05, max(c.median_dt / max(window, 1.0), 0.005))
-                c.bias = (1.0 - alpha) * c.bias + alpha * b
-
-        # Relative biases have one unconstrained common mode.  Re-anchor that
-        # mode after every live update so the absolute ensemble cannot drift
-        # away from the raw robust centre while pairwise differences remain
-        # unchanged.
-        gauge_shift = self.normalize_bias_gauge()
 
         src_now = updated_source or self._last_updated_source
-        if not src_now or not self._record_close_pairs(now, tau, src_now):
-            return gauge_shift
+        if src_now:
+            self._record_close_pairs(now, tau, src_now)
 
-        live_rows, live_counts, live_spans = self._pair_rows_live(now, window)
-        live_pair_counts = {src: 0 for src in self.calibrations}
-        for sa, sb, _var, _count, _span in live_rows:
-            live_pair_counts[sa] = live_pair_counts.get(sa, 0) + 1
-            live_pair_counts[sb] = live_pair_counts.get(sb, 0) + 1
-        for src in self.calibrations:
-            self.live_calibration_samples[src] = int(live_counts.get(src, 0))
-            self.live_calibration_span[src] = float(live_spans.get(src, 0.0))
-            self.live_calibration_pairs[src] = int(live_pair_counts.get(src, 0))
+        for dq in self.pair_residuals.values():
+            while dq and dq[0][0] < cutoff:
+                dq.popleft()
 
-        rows = self._combine_startup_and_live_rows(live_rows, now=now, window=window)
-        solved = _solve_source_variances(self.calibrations, rows)
-        if not solved:
-            return gauge_shift
+        interval = self._refit_interval(window)
+        if self._last_refit_ts and now - self._last_refit_ts < interval:
+            return False
 
-        counts, spans, pair_counts = self._combined_source_evidence(
-            live_counts, live_spans, rows, now=now, window=window
+        return self._full_refit(now, window)
+
+    def _full_refit(self, now: float, window: float):
+        """Run the expensive rolling bias/noise calibration pass."""
+        started = time.perf_counter()
+        self._refit_runs += 1
+        self._last_refit_ts = float(now)
+        point_count = (
+            sum(len(dq) for dq in self.residuals.values())
+            + sum(len(dq) for dq in self.pair_residuals.values())
         )
-        for src, var in solved.items():
-            c = self.calibrations[src]
-            # rows already carry the correct startup/live time weighting; keep
-            # the existing sigma smoother and only change the evidence it sees.
-            target = math.sqrt(max(var, 1e-12))
-            alpha = min(0.05, max(c.median_dt / max(window, 1.0), 0.005))
-            floor = max(c.typical_abs_level * 1e-6, 1e-9)
-            c.sigma = max((1.0 - alpha) * c.sigma + alpha * target, floor)
-            c.calibration_samples = int(counts.get(src, 0))
-            c.calibration_span = float(spans.get(src, 0.0))
-            c.calibration_pairs = int(pair_counts.get(src, 0))
+        self._refit_last_points = int(point_count)
 
-        return gauge_shift
+        try:
+            for src, dq in self.residuals.items():
+                if src not in self.calibrations or len(dq) < 8:
+                    continue
+                c = self.calibrations[src]
+                vals = [v for _, v in dq]
+                b = _median(vals)
+                alpha = min(
+                    0.05, max(c.median_dt / max(window, 1.0), 0.005)
+                )
+                c.bias = (1.0 - alpha) * c.bias + alpha * b
 
+            self.normalize_bias_gauge()
+
+            live_rows, live_counts, live_spans = self._pair_rows_live(
+                now, window
+            )
+            live_pair_counts = {src: 0 for src in self.calibrations}
+            for sa, sb, _var, _count, _span in live_rows:
+                live_pair_counts[sa] = live_pair_counts.get(sa, 0) + 1
+                live_pair_counts[sb] = live_pair_counts.get(sb, 0) + 1
+
+            for src in self.calibrations:
+                self.live_calibration_samples[src] = int(
+                    live_counts.get(src, 0)
+                )
+                self.live_calibration_span[src] = float(
+                    live_spans.get(src, 0.0)
+                )
+                self.live_calibration_pairs[src] = int(
+                    live_pair_counts.get(src, 0)
+                )
+
+            rows = self._combine_startup_and_live_rows(
+                live_rows, now=now, window=window
+            )
+            solved = _solve_source_variances(self.calibrations, rows)
+
+            if solved:
+                counts, spans, pair_counts = self._combined_source_evidence(
+                    live_counts, live_spans, rows, now=now, window=window
+                )
+                for src, var in solved.items():
+                    c = self.calibrations[src]
+                    target = math.sqrt(max(var, 1e-12))
+                    alpha = min(
+                        0.05,
+                        max(c.median_dt / max(window, 1.0), 0.005),
+                    )
+                    floor = max(c.typical_abs_level * 1e-6, 1e-9)
+                    c.sigma = max(
+                        (1.0 - alpha) * c.sigma + alpha * target,
+                        floor,
+                    )
+                    c.calibration_samples = int(counts.get(src, 0))
+                    c.calibration_span = float(spans.get(src, 0.0))
+                    c.calibration_pairs = int(pair_counts.get(src, 0))
+
+            return True
+        except Exception:
+            self._refit_failures += 1
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self._refit_last_ms = float(elapsed_ms)
+            self._refit_max_ms = max(
+                self._refit_max_ms, float(elapsed_ms)
+            )
