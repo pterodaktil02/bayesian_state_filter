@@ -2,6 +2,19 @@
 
 ## 0.4.0 - 2026-09-24
 
+### Root cause
+
+The performance regression was traced to online source calibration rather than the 4D Kalman update itself. The hot path accepted a new observation and then immediately recomputed robust bias/noise statistics over the retained calibration evidence. With several ~1 Hz pressure sources and a multi-day calibration window, the amount of work therefore grew with accumulated history while the information gain from each additional sample was negligible.
+
+In practice this produced a characteristic sawtooth CPU profile: load increased as the calibration evidence grew, eventually saturating the Home Assistant event-loop thread, then dropped when retained state was rebuilt or trimmed and the cycle started again.
+
+The fix separates two timescales that should never have shared one execution path:
+
+- per-sample estimation remains O(1)-like and uses the already learned source calibration;
+- expensive O(history) metrology is treated as a background re-certification step, scheduled from drift evidence.
+
+During the investigation, two secondary issues were also found and removed: oversized `source_health` attributes were being rebuilt and serialized on every state update, and the first adaptive scheduler prototype used a fixed outlier threshold that could falsely classify a naturally noisier source as `watch`, recreating a six-hour heavy-refit cadence. The final scheduler uses a per-source historical outlier baseline.
+
 ### Performance
 - Removed the O(history) source recalibration pass from the per-sample hot path.
 - Added a cheap O(1) innovation/drift monitor and adaptive heavy-refit scheduling.

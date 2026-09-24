@@ -21,66 +21,7 @@ Typical use cases include temperature, pressure, humidity, radiation background 
 
 > This is unrelated to Home Assistant's built-in `bayesian` integration, which estimates event probability and produces a binary sensor. This project estimates a continuous numeric state.
 
-## What changed in 0.4.0
-
-The main 0.4.0 change is a hot-path performance fix in online source
-calibration. Previously, every incoming observation could trigger a
-`bias/sigma` re-estimation over a growing history window. With fast sources
-this turned an almost unchanged metrology estimate into an O(history)
-operation on every sample and could eventually consume the Home Assistant
-event-loop CPU.
-
-Each sample now performs only the normal filter update plus a cheap O(1)
-drift monitor. The full O(history) calibration pass is scheduled adaptively:
-
-```text
-stable   -> approximately once per calibration_window / 2
-watch    -> more often when drift becomes noticeable
-unstable -> more often again under clear degradation
-```
-
-Drift is evaluated relative to each source's own established outlier baseline,
-so a sensor that normally sits around a 4% outlier rate is not permanently
-classified as suspicious merely for exceeding a global fixed threshold.
-
-Adaptive scheduler state is persisted in the checkpoint. A normal restart from
-a compatible checkpoint neither repeats the full multi-day bootstrap nor
-forces an immediate heavy refit.
-
-`source_health` was also reduced to compact runtime fields so a large nested
-diagnostic payload is not serialized on every sensor update. Detailed CPU and
-background-work diagnostics are exposed separately under `cpu_diag_*`.
-
-0.4.0 also adds `bias_anchor`:
-
-- `median` - the previous robust zero gauge;
-- `mean` - a linear sum-to-zero gauge;
-- `passport` - an absolute anchor from model datasheet accuracy, with one
-  robust vote per model family regardless of how many identical physical
-  sensors are present.
-
-## What changed in 0.3.2
-
-Fixed the unidentifiable common mode of source `bias` calibration. Pairwise
-calibration determines only bias differences, so without an explicit gauge all
-source biases could drift together by the same constant and move the absolute
-ensemble level without changing any cross-sensor residual.
-
-Startup and live calibration now enforce:
-
-```text
-median(bias_i) = 0
-```
-
-This matches the robust median fusion used by the filter: relative source
-corrections are preserved, while the common bias zero point can no longer
-wander. Existing 0.3.1 checkpoints are migrated without a full retrain: the
-common bias offset is removed and the stored level plus level-history are
-shifted by the same amount.
-
-## What changed in 0.3.1
-
-Version 0.3 ports the four-dimensional model validated in the experimental `bayesian_trend_filter 0.6.3` into the production filter.
+## State model
 
 The state is always:
 
@@ -144,7 +85,7 @@ The Student-t updater may assign a weight slightly above 1 to a well-aligned inl
 
 RMSE is a diagnostic of the fitted dynamics, not a definition of derivative confidence. Confidence is derived only from the posterior state and covariance.
 
-### Fast restart
+### Fast restart and checkpoints
 
 The integration writes a checkpoint to Home Assistant Store every **30 minutes**.
 
@@ -167,7 +108,19 @@ load checkpoint
 -> switch to live mode
 ```
 
-A full multi-day bootstrap is only required when the checkpoint is missing, corrupted or schema-incompatible.
+A full multi-day bootstrap is only required when the checkpoint is missing, corrupted or schema-incompatible. Online source calibration is not recomputed on every sample; expensive refits are scheduled adaptively from drift-monitor state.
+
+## Online source calibration
+
+Each observation performs the normal filter update plus a cheap drift monitor. Re-estimation of source `bias/sigma` over the historical window runs separately and adaptively: infrequently for stable sources and more often when drift is detected.
+
+Drift is evaluated relative to each source's own baseline rather than a single global threshold. Scheduler state is persisted in the checkpoint.
+
+Three common-bias gauges are available through `bias_anchor`:
+
+- `median` - robust relative zero gauge;
+- `mean` - linear sum-to-zero gauge;
+- `passport` - absolute anchoring from model datasheet accuracy, with one robust vote per model family regardless of the number of identical physical sensors.
 
 ## Installation
 
@@ -226,7 +179,7 @@ sensor:
       history_days: 7
       save_every_s: 1800
       student_nu: 4
-      characteristic_refit_s: 1800
+      characteristic_refit_s: 21600
       diagnostics: compact
 ```
 
