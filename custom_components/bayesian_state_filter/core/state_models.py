@@ -49,15 +49,18 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
 
         c(z) = 2*Phi(z) - 1 = erf(z / sqrt(2))
 
-    No gate threshold or exponent is trained.  Confidence is therefore a
-    probabilistic statement about the derivative estimate rather than a knob
-    tuned to prediction RMSE.
+    No gate threshold is trained. Confidence remains a probabilistic
+    statement about the derivative estimate. Higher-order derivatives are
+    deliberately gated more strongly by an exponential decay in confidence
+    deficit::
+
+        g_k(c) = exp(-k * (1-c) / c)
 
     Coupling is hierarchical along the kinematic chain::
 
-        w_v = c_v
-        w_a = c_v * c_a
-        w_j = c_v * c_a * c_j
+        w_v = g_1(c_v)
+        w_a = w_v * g_2(c_a)
+        w_j = w_a * g_3(c_j)
 
     Hence 1 >= w_v >= w_a >= w_j >= 0 while all four state components remain
     estimated at all times.
@@ -67,7 +70,10 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         super().__init__(order)
 
     def gate_parameters(self):
-        return {"law": "erf_abs_z_over_sqrt2"}
+        return {
+            "law": "erf_abs_z_over_sqrt2",
+            "hierarchy": "exponential_confidence_deficit",
+        }
 
     @staticmethod
     def significance(value: float, variance: float) -> float:
@@ -95,13 +101,40 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
             c[order] = self.derivative_weight(x, P, order)
         return c
 
+    @staticmethod
+    def _order_gate(confidence: float, order: int) -> float:
+        """Exponentially suppress weak derivative evidence.
+
+        ``confidence`` is already a posterior probability-like quantity in
+        [0, 1].  The transform is exactly zero at c=0, exactly one at c=1 and
+        decays increasingly aggressively with derivative order without adding
+        a hard threshold.
+        """
+        c = min(1.0, max(0.0, float(confidence)))
+        if c <= 0.0:
+            return 0.0
+        if c >= 1.0:
+            return 1.0
+        return float(math.exp(-float(order) * (1.0 - c) / c))
+
     def effective_weights(self, x, P, dt: float):
-        """Hierarchical coupling weights for the derivative chain."""
+        """Hierarchical coupling weights for the derivative chain.
+
+        Each derivative contributes an order-dependent exponential gate:
+
+            g_k(c) = exp(-k * (1-c) / c)
+
+        and the kinematic hierarchy remains cumulative:
+
+            w_v = g_1(c_v)
+            w_a = w_v * g_2(c_a)
+            w_j = w_a * g_3(c_j)
+        """
         c = self.confidence_weights(x, P)
         w = np.ones(self.dim_x(), dtype=float)
         cumulative = 1.0
         for order in range(1, self.dim_x()):
-            cumulative *= float(c[order])
+            cumulative *= self._order_gate(c[order], order)
             w[order] = cumulative
         return w
 

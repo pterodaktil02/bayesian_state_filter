@@ -7,6 +7,7 @@ import logging
 import math
 import statistics
 import time
+import numpy as np
 from collections import deque
 from functools import partial
 from datetime import datetime, timedelta, timezone
@@ -37,7 +38,9 @@ from .const import (
     ATTR_FILTER_MODE, ATTR_PROCESS_NOISE, ATTR_SOURCE_HEALTH,
     ATTR_MEASUREMENT_VARIANCE, ATTR_EFFECTIVE_INNOVATION_VARIANCE,
     ATTR_UPDATE_DT,
-    ATTR_RATE_PER_HOUR, ATTR_CURVATURE_PER_HOUR2, ATTR_JERK_PER_HOUR3,
+    ATTR_RATE_PER_HOUR, ATTR_RATE_STDDEV_PER_HOUR,
+    ATTR_CURVATURE_PER_HOUR2, ATTR_CURVATURE_STDDEV_PER_HOUR2,
+    ATTR_JERK_PER_HOUR3, ATTR_JERK_STDDEV_PER_HOUR3,
     ATTR_RATE_WEIGHT, ATTR_CURVATURE_WEIGHT, ATTR_JERK_WEIGHT,
     ATTR_RATE_Z, ATTR_CURVATURE_Z, ATTR_JERK_Z,
     ATTR_GATED_TIMESCALE, ATTR_GATED_LOCAL_RMSE,
@@ -48,13 +51,16 @@ from .const import (
 )
 from .core.filter import CoreFilter
 from .core.noise_models import GaussianNoise, PoissonLikeNoise
+from .core.noise_detection import NoiseDetectionResult, detect_noise_model
 from .core.process_noise import IntegratedWienerProcessNoise
 from .core.state_models import AdaptivePolynomialStateModel
 from .core.gated_training import GatedDynamicsEstimate, train_gated_dynamics
 from .core.training import (
+    BiasAnchorResult,
     OnlineSourceCalibrator,
     SourceCalibration,
     calibrate_history,
+    estimate_biases_from_history,
 )
 from .core.types import Observation
 from .core.updaters import StudentTUpdater
@@ -68,11 +74,11 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class BayesianEnsembleSensor(SensorEntity):
-    """Bayesian State Filter 0.4.0.
+    """Bayesian State Filter 0.4.1.
 
-    Backward-compatible YAML platform.  The implementation is intentionally
-    source-aware: raw observations are never collapsed into one irreversible
-    weighted average before the Bayesian update.
+    Backward-compatible YAML platform. Multi-source observations are fused
+    from the latest per-source estimates at a common time. Older source
+    estimates remain usable, but their predictive variance grows with age.
     """
 
     _attr_has_entity_name = True
@@ -104,6 +110,7 @@ class BayesianEnsembleSensor(SensorEntity):
             if model:
                 self._source_models[entity_id] = model
         self.min_sources = max(int(ens_cfg.get("min_sources", 1)), 1)
+        self._single_source = len(self.sources) == 1
 
         self._model_accuracy = {}
         for model, spec in (ens_cfg.get("models", {}) or {}).items():
@@ -175,13 +182,15 @@ class BayesianEnsembleSensor(SensorEntity):
         self._gaussian_noise = GaussianNoise(sigma=0.1)
         self._poisson_noise = PoissonLikeNoise(k=0.1)
         self._noise_model_name = "gaussian"
+        self._noise_detection_version = 2
+        self._noise_detection = NoiseDetectionResult(reason="not_yet_detected")
 
         default_tau = self._tau_min_s or 3600.0
         self.filter = CoreFilter(
             state_model=AdaptivePolynomialStateModel(3),
             noise_model=self._gaussian_noise,
             updater=StudentTUpdater(nu=self._student_nu, min_weight=0.05),
-            process_noise=IntegratedWienerProcessNoise(order=3, q=0.0),
+            process_noise=IntegratedWienerProcessNoise(order=3, q=0.0, level_q=0.0),
             prior_timescale_s=default_tau,
         )
 
@@ -199,7 +208,23 @@ class BayesianEnsembleSensor(SensorEntity):
         self._characteristic_task = None
         self._last_characteristic_fit_ts = 0.0
 
-        self._warmup_history = {src: [] for src in self.sources}
+        # Relative bias is a long-horizon metrology parameter. Refit it only
+        # from the configured Recorder history (history_days), never from the
+        # short live calibration window. With the default 7 d history this is
+        # one refit per day; shorter configured histories never refit faster
+        # than every 6 h.
+        self._bias_history_refit_s = max(self._history_days * 86400.0 / 7.0, 21600.0)
+        self._bias_history_task = None
+        self._last_bias_history_refit_ts = 0.0
+
+        self._warmup_history = {
+            src: deque(maxlen=self._warmup_max_points_per_source)
+            for src in self.sources
+        }
+        # Source cadence must not depend on warmup history.  Once gated
+        # dynamics are restored/trained, warmup history is deliberately
+        # stopped and cleared, while cadence estimation continues here.
+        self._last_source_event_ts: dict[str, float] = {}
         self._warmup_task = None
         self._last_warmup_fit_ts = 0.0
 
@@ -226,6 +251,15 @@ class BayesianEnsembleSensor(SensorEntity):
             "save_last_bytes_est": 0,
         }
 
+        # Estimator still processes every source observation.  Publish the
+        # numeric state at ~1 Hz so Recorder sees a smooth trajectory, while
+        # rebuilding the expensive diagnostics dictionary only every 5 s.
+        # This keeps the chart smooth without returning to ~3 full attr builds/s.
+        self._publish_interval_s = 1.0
+        self._attrs_publish_interval_s = 5.0
+        self._last_state_publish_monotonic = None
+        self._last_attrs_publish_monotonic = None
+
         self._state = None
         self._attrs = {}
         # Diagnostics of the most recent *live* observation.  Keep these
@@ -239,7 +273,7 @@ class BayesianEnsembleSensor(SensorEntity):
         self._source_last_diag: dict[str, dict] = {}
         self._ready = False
         self._last_save_ts = 0.0
-        self._checkpoint_version = 6
+        self._checkpoint_version = 8
         self._checkpoint_config_fingerprint = self._make_checkpoint_config_fingerprint()
         self._last_processed_by_source: dict[str, float] = {}
         self._startup_mode = "initializing"
@@ -249,6 +283,22 @@ class BayesianEnsembleSensor(SensorEntity):
         # configuration checkpoint during YAML/platform reload or shutdown.
         self._store_key = f"{DOMAIN}_{slug}_passport_{self._checkpoint_config_fingerprint[:16]}"
         self._store = Store(hass, 1, self._store_key)
+
+    def _publication_due(self) -> bool:
+        now = time.perf_counter()
+        last = self._last_state_publish_monotonic
+        if last is None or now - last >= self._publish_interval_s:
+            self._last_state_publish_monotonic = now
+            return True
+        return False
+
+    def _attrs_refresh_due(self) -> bool:
+        now = time.perf_counter()
+        last = self._last_attrs_publish_monotonic
+        if last is None or now - last >= self._attrs_publish_interval_s:
+            self._last_attrs_publish_monotonic = now
+            return True
+        return False
 
     @staticmethod
     def _optional_float(value):
@@ -271,7 +321,7 @@ class BayesianEnsembleSensor(SensorEntity):
             try:
                 await self._initialize()
             except Exception:
-                _LOGGER.exception("Bayesian State Filter 0.4.0 initialization failed")
+                _LOGGER.exception("Bayesian State Filter 0.4.1 initialization failed")
                 await self._restore_fallback()
             self._seed_current_sources()
             self._ready = True
@@ -285,6 +335,8 @@ class BayesianEnsembleSensor(SensorEntity):
             self._warmup_task.cancel()
         if self._characteristic_task is not None:
             self._characteristic_task.cancel()
+        if self._bias_history_task is not None:
+            self._bias_history_task.cancel()
         await self._save_state()
 
     # ------------------------------------------------------------------
@@ -299,13 +351,18 @@ class BayesianEnsembleSensor(SensorEntity):
         # checkpoint/schema change).
         if await self._restore_checkpoint():
             self._startup_mode = "checkpoint_restore"
+            if self._noise_mode_cfg == "auto" and self._noise_detection.reason == "not_yet_detected":
+                pseudo_history = {"restored_level": list(self._level_history)}
+                self._noise_detection = await self.hass.async_add_executor_job(
+                    lambda: detect_noise_model(pseudo_history)
+                )
+            self._apply_noise_model()
             await self._catch_up_from_recorder()
-            self._select_noise_model()
             if self.filter.t_last is not None:
                 self._state = round(float(self.filter.x[0]), 6)
                 self._build_attrs(last_out=None)
             _LOGGER.info(
-                "Bayesian State Filter 0.4.0 restored checkpoint and caught up incrementally; t=%.3f",
+                "Bayesian State Filter 0.4.1 restored checkpoint and caught up incrementally; t=%.3f",
                 float(self.filter.t_last or 0.0),
             )
             return
@@ -321,6 +378,12 @@ class BayesianEnsembleSensor(SensorEntity):
         if not histories:
             await self._restore_fallback()
             return
+
+        if self._noise_mode_cfg == "auto":
+            self._noise_detection = await self.hass.async_add_executor_job(
+                lambda: detect_noise_model(histories)
+            )
+            self._apply_noise_model()
 
         result = await self.hass.async_add_executor_job(
             lambda: calibrate_history(
@@ -346,6 +409,10 @@ class BayesianEnsembleSensor(SensorEntity):
             source_models=self._source_models,
             model_accuracy=self._model_accuracy,
             huber_delta=self._bias_huber_delta,
+        )
+        self._last_bias_history_refit_ts = max(
+            (float(seq[-1][0]) for seq in histories.values() if seq),
+            default=0.0,
         )
         if self._calibrations:
             sigmas = sorted(c.sigma for c in self._calibrations.values() if c.sigma > 0)
@@ -376,8 +443,9 @@ class BayesianEnsembleSensor(SensorEntity):
                 T = max(self._gated_dynamics.history_span_s, self._level_grid_step, 1.0)
             self.filter.tau = T
             self.filter.q_process = self._gated_dynamics.q_process
+            self.filter.level_q_process = self._gated_dynamics.level_q_process
 
-        self._select_noise_model()
+        self._apply_noise_model()
 
         if result.fused_points:
             await self.hass.async_add_executor_job(self._replay_fused, dynamics_points)
@@ -391,11 +459,12 @@ class BayesianEnsembleSensor(SensorEntity):
             self._build_attrs(last_out=None)
             await self._save_state()
             _LOGGER.info(
-                "Bayesian State Filter 0.4.0 trained from %.2f d: gated_tau=%s q=%s "
+                "Bayesian State Filter 0.4.1 trained from %.2f d: gated_tau=%s q=%s level_q=%s "
                 "local_rmse=%s characteristic_time=%s (status=%s, conf=%.3f)",
                 result.history_span / 86400.0,
                 (f"{self.filter.tau:.1f} s" if self._gated_dynamics is not None else "fallback"),
                 f"{self.filter.q_process:.6e}",
+                f"{self.filter.level_q_process:.6e}",
                 (f"{self._gated_dynamics.validation_rmse:.6g}" if self._gated_dynamics is not None else "unknown"),
                 (f"{self._characteristic.tau:.1f} s" if self._characteristic and self._characteristic.tau is not None else "unknown"),
                 self._characteristic.status if self._characteristic else "unavailable",
@@ -518,26 +587,52 @@ class BayesianEnsembleSensor(SensorEntity):
         )
 
         if self._fresh_source_count(t) < self.min_sources:
-            self._warmup_history.setdefault(src, []).append((t, raw))
-            self._trim_warmup_history(t)
+            if self._gated_dynamics is None:
+                self._append_warmup_sample(src, t, raw)
             return
 
         source_corrected = raw - cal.bias
-        corrected = source_corrected
-        mode = self._select_noise_model(st)
-        variance = cal.variance(corrected, noise_mode=mode)
+        mode = self._apply_noise_model()
+
+        # Multi-source mode is an estimate of one common physical quantity,
+        # not a queue of independent measurements. Build one contemporaneous
+        # ensemble observation from the latest estimate of every fresh source.
+        # A slow source is not down-weighted merely because it is slow: its
+        # value is transported to ``t`` and the uncertainty of that transport
+        # is added to its measurement variance.
+        fused = self._current_fused_snapshot(t, with_components=True)
+        if fused is None:
+            return
+        corrected, variance, components = fused
 
         if self.filter.t_last is None:
-            bootstrap = self._bootstrap_median(t)
-            corrected = bootstrap if bootstrap is not None else corrected
+            # The fused snapshot is already a robust bootstrap measurement.
+            # Do not fall back to one arbitrary triggering source.
+            pass
 
         out = self.filter.step(Observation(
-            t=t, z=corrected, source=src, variance=variance,
-            meta={"raw": raw, "bias": cal.bias},
+            t=t, z=corrected, source="ensemble" if not self._single_source else src,
+            variance=variance,
+            meta={"trigger_source": src, "raw": raw, "bias": cal.bias},
         ))
 
-        z = abs(out.innovation) / math.sqrt(max(out.innovation_var, NUMERIC_VARIANCE_FLOOR))
-        weight = float(out.diag.get("weight", 1.0))
+        # Source health is diagnostic evidence about the triggering source
+        # relative to the contemporaneous ensemble, not the Kalman innovation
+        # of the fused measurement. This avoids attributing a common process
+        # move to whichever source happened to report first.
+        if self._single_source:
+            z = abs(out.innovation) / math.sqrt(
+                max(out.innovation_var, NUMERIC_VARIANCE_FLOOR)
+            )
+            weight = float(out.diag.get("weight", 1.0))
+        else:
+            comp = components.get(src)
+            if comp is not None:
+                z = float(comp["z_score"])
+                weight = float(comp["robust_weight"])
+            else:
+                z = 0.0
+                weight = 1.0
         cal.updates += 1
         if weight < 0.25 or z > 4.0:
             cal.outliers += 1
@@ -545,31 +640,42 @@ class BayesianEnsembleSensor(SensorEntity):
         self._source_last_diag[src] = {
             "raw": float(raw),
             "corrected": float(source_corrected),
-            "innovation": float(out.innovation),
+            "innovation": float(source_corrected - corrected),
             "z_score": float(z),
             "robust_weight": float(weight),
         }
-        self._source_cal.observe_innovation(src, t, z, weight)
+        if not self._single_source:
+            self._source_cal.observe_innovation(src, t, z, weight)
 
         self._update_dynamics(t, corrected, variance, out.dt)
         self._append_level_snapshot(t)
         if schedule_background:
             self._maybe_schedule_characteristic_fit(t)
+            self._maybe_schedule_bias_history_refit(t)
         self._state = round(out.y_mean, 6)
         self._last_source = src
         self._remember_update_diag(out)
-        self._build_attrs(last_out=out)
-        if write_state:
+        # Keep estimator hot-path and HA publication cadence independent.
+        # For dense sources we publish at most once per configured interval.
+        # Sparse sources naturally publish every observation because their
+        # inter-arrival time exceeds the throttle.
+        if write_state and self._publication_due():
+            if not self._attrs or self._attrs_refresh_due():
+                self._build_attrs(last_out=out)
             self.async_write_ha_state()
 
-        self._warmup_history.setdefault(src, []).append((t, raw))
-        self._trim_warmup_history(t)
-        if schedule_background and self._gated_dynamics is None:
-            self._maybe_schedule_warmup_training()
+        if self._gated_dynamics is None:
+            self._append_warmup_sample(src, t, raw)
+            if schedule_background:
+                self._maybe_schedule_warmup_training()
+        elif any(self._warmup_history.values()):
+            # Restored/trained dynamics make warmup evidence dead weight.
+            self._clear_warmup_history()
 
         if allow_save and t - self._last_save_ts >= self._save_every_s:
             self._last_save_ts = t
             await self._save_state()
+
 
     async def _catch_up_from_recorder(self):
         """Replay only source observations newer than the persisted watermarks."""
@@ -626,48 +732,155 @@ class BayesianEnsembleSensor(SensorEntity):
             return max(float(self._characteristic.tau), 1.0)
         return max(float(self.filter.tau), 1.0)
 
+    def _transport_source_to_now(self, corrected: float, age_s: float):
+        """Transport a cached source estimate to the current ensemble time.
+
+        The cached value remains an estimate of the same physical process.
+        We use the current common derivative posterior only to transport its
+        mean; uncertainty in that transport is added to the source variance.
+        Thus source age affects *variance*, not an arbitrary age weight.
+        """
+        age = max(float(age_s), 0.0)
+        if age <= 1e-9 or self.filter.t_last is None:
+            return float(corrected), 0.0
+
+        try:
+            x = self.filter.x
+            P = self.filter.P
+            weights = self.filter.state_model.effective_weights(x, P, age)
+
+            h = np.zeros(len(x), dtype=float)
+            delta = 0.0
+            for order in range(1, len(x)):
+                coeff = float(weights[order]) * (age ** order) / math.factorial(order)
+                delta += coeff * float(x[order])
+                h[order] = coeff
+
+            # Uncertainty of the inferred process change since the source last
+            # reported, plus fresh process noise accumulated over that age.
+            derivative_var = float(h @ P @ h.T)
+            q = self.filter.process_noise.Q(age)
+            process_var = float(q[0, 0]) if q.size else 0.0
+            age_var = max(derivative_var, 0.0) + max(process_var, 0.0)
+            if not math.isfinite(age_var):
+                age_var = float("inf")
+            return float(corrected + delta), age_var
+        except Exception:
+            # Conservative fallback: keep the last estimate and at least grow
+            # uncertainty with the independent level random walk.
+            q_level = max(float(self.filter.level_q_process), 0.0)
+            return float(corrected), float(q_level * age)
+
     @staticmethod
-    def _robust_median_variance(values, variances):
+    def _robust_fuse(values, variances, labels=None):
+        """Variance-aware robust fusion of contemporaneous source estimates.
+
+        Median/MAD provide the robust centre/scale used only for outlier
+        resistance. The final location is a precision-weighted mean, so an
+        older source contributes less *only because its propagated variance is
+        larger*. A conservative variance floor prevents correlated sensors from
+        making the ensemble spuriously overconfident.
+        """
         if not values:
             return None
-        vals = list(map(float, values))
-        vars_ = [max(float(v), 1e-12) for v in variances]
-        zmed = float(statistics.median(vals))
-        if len(vals) >= 3:
-            absdev = [abs(v - zmed) for v in vals]
-            scale = 1.4826 * float(statistics.median(absdev))
-            floor = math.sqrt(float(statistics.median(vars_)))
-            scale = max(scale, floor, 1e-12)
-            kept = [(z, v) for z, v in zip(vals, vars_) if abs(z - zmed) <= 4.685 * scale]
-            if kept:
-                vals = [z for z, _ in kept]
-                vars_ = [v for _, v in kept]
-                zmed = float(statistics.median(vals))
-        if len(vars_) == 1:
-            vf = vars_[0]
-        else:
-            mvar = float(statistics.median(vars_))
-            vf = max(1.57 * mvar / len(vars_), 0.25 * mvar, 1e-12)
-        return zmed, vf
+        vals = np.asarray(values, dtype=float)
+        vars_ = np.maximum(np.asarray(variances, dtype=float), 1e-12)
+        n = len(vals)
 
-    def _current_fused_snapshot(self, now):
+        center = float(np.median(vals))
+        mad = 1.4826 * float(np.median(np.abs(vals - center))) if n > 1 else 0.0
+        sensor_floor = math.sqrt(float(np.median(vars_)))
+        scale = max(mad, sensor_floor, 1e-12)
+
+        # Huber-style robust factor around a median seed. The source precision
+        # still comes exclusively from its propagated variance.
+        denom = np.sqrt(vars_ + scale * scale)
+        u = np.abs(vals - center) / np.maximum(denom, 1e-12)
+        delta = 2.5
+        robust = np.ones(n, dtype=float)
+        mask = u > delta
+        robust[mask] = delta / np.maximum(u[mask], 1e-12)
+
+        precision = robust / vars_
+        psum = float(np.sum(precision))
+        if not math.isfinite(psum) or psum <= 0.0:
+            return None
+        fused = float(np.sum(precision * vals) / psum)
+
+        # Independent precision result, plus conservative floors for common
+        # process correlation and actual inter-source disagreement.
+        independent_var = 1.0 / psum
+        median_var = float(np.median(vars_))
+        p2 = float(np.sum(precision * precision))
+        n_eff = (psum * psum / p2) if p2 > 0.0 else 1.0
+        disagreement = float(np.sum(precision * (vals - fused) ** 2) / psum)
+        disagreement_mean_var = disagreement / max(n_eff, 1.0)
+        fused_var = max(
+            independent_var,
+            0.25 * median_var,
+            disagreement_mean_var,
+            1e-12,
+        )
+
+        components = {}
+        if labels is not None:
+            for i, label in enumerate(labels):
+                # Diagnostic source residual relative to the fused ensemble.
+                resid_var = max(float(vars_[i]) + fused_var, 1e-12)
+                z = abs(float(vals[i]) - fused) / math.sqrt(resid_var)
+                components[label] = {
+                    "value": float(vals[i]),
+                    "variance": float(vars_[i]),
+                    "z_score": float(z),
+                    "robust_weight": float(robust[i]),
+                }
+        return fused, fused_var, components
+
+    def _current_fused_snapshot(self, now, *, with_components=False):
         if self._source_cal is None:
             return None
-        values, variances = [], []
+        values, variances, labels = [], [], []
         tau = self._window_tau()
-        for src, (t, raw) in self._source_cal.cache.items():
+        mode = self._noise_model_name
+        for src, (t_src, raw) in self._source_cal.cache.items():
             cal = self._calibrations.get(src)
             if cal is None:
                 continue
-            max_age = max(FRESHNESS_MEDIAN_DT_MULTIPLIER * cal.median_dt, FRESHNESS_TAU_FRACTION * tau, FRESHNESS_MIN_S)
-            if now - t > max_age:
+            age = max(float(now) - float(t_src), 0.0)
+            max_age = max(
+                FRESHNESS_MEDIAN_DT_MULTIPLIER * cal.median_dt,
+                FRESHNESS_TAU_FRACTION * tau,
+                FRESHNESS_MIN_S,
+            )
+            if age > max_age:
                 continue
-            corrected = raw - cal.bias
-            values.append(corrected)
-            variances.append(cal.variance(corrected, noise_mode=self._noise_model_name))
+            corrected = float(raw) - float(cal.bias)
+            base_var = cal.variance(corrected, noise_mode=mode)
+
+            # A source is not stale merely because it has not published again
+            # before its normal reporting cadence.  This matters especially for
+            # event-driven/battery sensors (for example Aqara) and also removes
+            # sub-second precision modulation between nominally 1 Hz sources.
+            # Only the age *beyond* the source's typical reporting interval is
+            # propagated into extra prediction uncertainty.
+            cadence_s = max(float(cal.median_dt), 0.0)
+            excess_age = max(0.0, age - cadence_s)
+            value_now, age_var = self._transport_source_to_now(corrected, excess_age)
+            eff_var = max(float(base_var) + float(age_var), 1e-12)
+            if not (math.isfinite(value_now) and math.isfinite(eff_var)):
+                continue
+            values.append(value_now)
+            variances.append(eff_var)
+            labels.append(src)
         if len(values) < self.min_sources:
             return None
-        return self._robust_median_variance(values, variances)
+        fused = self._robust_fuse(values, variances, labels)
+        if fused is None:
+            return None
+        z, var, components = fused
+        if with_components:
+            return z, var, components
+        return z, var
 
     def _append_level_snapshot(self, now):
         snap = self._current_fused_snapshot(now)
@@ -684,6 +897,103 @@ class BayesianEnsembleSensor(SensorEntity):
         cutoff = now - self._history_days * 86400.0
         while self._level_history and self._level_history[0][0] < cutoff:
             self._level_history.popleft()
+
+    def _maybe_schedule_bias_history_refit(self, now):
+        if len(self.sources) < 2:
+            return
+        if self._bias_history_task is not None and not self._bias_history_task.done():
+            return
+        if (self._last_bias_history_refit_ts
+                and float(now) - self._last_bias_history_refit_ts < self._bias_history_refit_s):
+            return
+        self._last_bias_history_refit_ts = float(now)
+        self._bias_history_task = self.hass.async_create_task(
+            self._refit_bias_from_recorder()
+        )
+
+    async def _refit_bias_from_recorder(self):
+        """Re-estimate source bias from quiet sections of full Recorder history."""
+        try:
+            histories = {}
+            for entity_id in self.sources:
+                seq = await self._fetch_history(entity_id)
+                parsed = self._parse_states(seq)
+                if parsed:
+                    histories[entity_id] = parsed
+            if len(histories) < 2:
+                return
+
+            biases, stable_points, total_points = await self.hass.async_add_executor_job(
+                lambda: estimate_biases_from_history(
+                    histories,
+                    bias_anchor=self._bias_anchor,
+                    source_models=self._source_models,
+                    model_accuracy=self._model_accuracy,
+                    huber_delta=self._bias_huber_delta,
+                )
+            )
+            if not biases:
+                return
+
+            # A long-history refit estimates relative source offsets. Applying
+            # those offsets with a new common gauge can create an artificial
+            # level step even though the physical process did not move. Keep
+            # the current fused corrected level continuous by using the free
+            # common bias offset as a gauge adjustment.
+            now = datetime.now(timezone.utc).timestamp()
+            old_snapshot = self._current_fused_snapshot(now)
+            old_biases = {
+                src: float(cal.bias)
+                for src, cal in self._calibrations.items()
+            }
+
+            staged = {}
+            for src, bias in biases.items():
+                cal = self._calibrations.get(src)
+                if cal is not None and math.isfinite(float(bias)):
+                    staged[src] = float(bias)
+                    cal.bias = float(bias)
+
+            gauge_shift = 0.0
+            if staged:
+                new_snapshot = self._current_fused_snapshot(now)
+                if old_snapshot is not None and new_snapshot is not None:
+                    # corrected = raw - bias, so adding this common shift to
+                    # every bias subtracts the same amount from the new fused
+                    # level and restores the pre-refit level exactly.
+                    gauge_shift = float(new_snapshot[0] - old_snapshot[0])
+                else:
+                    # No contemporaneous fused snapshot (e.g. all sources are
+                    # stale). Preserve the previous gauge robustly from the
+                    # common component of the bias change.
+                    deltas = [
+                        old_biases[src] - staged[src]
+                        for src in staged
+                        if src in old_biases
+                    ]
+                    if deltas:
+                        gauge_shift = float(statistics.median(deltas))
+
+                if math.isfinite(gauge_shift) and gauge_shift != 0.0:
+                    for src in staged:
+                        self._calibrations[src].bias += gauge_shift
+
+            if self._source_cal is not None:
+                # Calibrations are shared objects.  Record the common gauge
+                # correction used to keep the live level continuous; relative
+                # inter-source bias estimates remain unchanged.
+                self._source_cal.last_anchor = BiasAnchorResult(
+                    mode=self._bias_anchor, shift=float(gauge_shift)
+                )
+            _LOGGER.info(
+                "Bayesian State Filter bias refit from %.2f d Recorder history: "
+                "stable_grid=%d/%d, gauge_shift=%+.8g",
+                self._history_days, stable_points, total_points, gauge_shift,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Bayesian State Filter long-history bias refit failed")
 
     def _maybe_schedule_characteristic_fit(self, now):
         if self._characteristic_task is not None and not self._characteristic_task.done():
@@ -768,21 +1078,30 @@ class BayesianEnsembleSensor(SensorEntity):
         return count
 
     def _update_source_dt(self, cal, src, t):
-        # ensure_source has already stored current time, so keep an independent
-        # last-event timestamp in warmup data for cadence adaptation.
-        hist = self._warmup_history.get(src, [])
-        if hist:
-            dt = t - hist[-1][0]
+        # Cadence estimation is independent of warmup history.  This avoids
+        # keeping/rebuilding thousands of obsolete warmup points forever.
+        prev = self._last_source_event_ts.get(src)
+        self._last_source_event_ts[src] = float(t)
+        if prev is not None:
+            dt = float(t) - float(prev)
             if dt > 0 and math.isfinite(dt):
                 # Robust-ish slow EW cadence estimate; large gaps are capped.
                 dt = min(dt, 10.0 * max(cal.median_dt, 1.0))
                 cal.median_dt = 0.95 * cal.median_dt + 0.05 * dt
 
-    def _trim_warmup_history(self, now):
-        cutoff = now - max(self._history_days * 86400.0, 3600.0)
-        for src, seq in self._warmup_history.items():
-            if len(seq) > 5000:
-                self._warmup_history[src] = [p for p in seq if p[0] >= cutoff][-self._warmup_max_points_per_source:]
+    def _append_warmup_sample(self, src, t, raw):
+        """Append one warmup point with O(1) bounded maintenance."""
+        dq = self._warmup_history.setdefault(
+            src, deque(maxlen=self._warmup_max_points_per_source)
+        )
+        dq.append((float(t), float(raw)))
+        cutoff = float(t) - max(self._history_days * 86400.0, 3600.0)
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+    def _clear_warmup_history(self):
+        for dq in self._warmup_history.values():
+            dq.clear()
 
     def _maybe_schedule_warmup_training(self):
         # Once gated dynamics exist, warmup training has completed its job.
@@ -846,6 +1165,8 @@ class BayesianEnsembleSensor(SensorEntity):
                             T = max(self._gated_dynamics.history_span_s, self._level_grid_step, 1.0)
                         self.filter.tau = T
                         self.filter.q_process = self._gated_dynamics.q_process
+                        self.filter.level_q_process = self._gated_dynamics.level_q_process
+                        self._clear_warmup_history()
                     except Exception:
                         _LOGGER.exception("Bayesian State Filter warmup gated dynamics training failed")
             # Preserve live calibration if it has more evidence; only fill
@@ -912,7 +1233,14 @@ class BayesianEnsembleSensor(SensorEntity):
             "bias_anchor": self._bias_anchor,
             "bias_huber_delta": float(self._bias_huber_delta),
             "noise_model": self._noise_mode_cfg,
+            "bias_history_version": 1,
         }
+        # Single-source observation-noise calibration has its own schema.
+        # Adding this key only for one-source configurations invalidates their
+        # old checkpoints once, without forcing established multi-source
+        # ensembles through a full Recorder bootstrap.
+        if len(self.sources) == 1:
+            payload["single_source_sigma_version"] = 1
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -938,6 +1266,8 @@ class BayesianEnsembleSensor(SensorEntity):
             "config_fingerprint": self._checkpoint_config_fingerprint,
             "saved_at": datetime.now(timezone.utc).timestamp(),
             "filter": self.filter.dump_state(),
+            "noise_detection_version": self._noise_detection_version,
+            "noise_detection": self._noise_detection.dump(),
             "sources": {k: v.dump() for k, v in self._calibrations.items()},
             "source_calibrator": source_cal_state,
             "gated_dynamics": (self._gated_dynamics.dump() if self._gated_dynamics is not None else None),
@@ -945,15 +1275,11 @@ class BayesianEnsembleSensor(SensorEntity):
             "level_grid_step": self._level_grid_step,
             "level_history": [list(p) for p in self._level_history],
             "last_characteristic_fit_ts": self._last_characteristic_fit_ts,
+            "last_bias_history_refit_ts": self._last_bias_history_refit_ts,
             "last_warmup_fit_ts": self._last_warmup_fit_ts,
             "last_processed_by_source": self._last_processed_by_source,
         }
         try:
-            # Estimate JSON payload size before handing it to Store. This is
-            # diagnostic only and is not used by the estimator.
-            self._diag_bg["save_last_bytes_est"] = len(
-                json.dumps(payload, separators=(",", ":"), default=str)
-            )
             await self._store.async_save(payload)
         except Exception:
             self._diag_bg["save_failures"] += 1
@@ -972,6 +1298,11 @@ class BayesianEnsembleSensor(SensorEntity):
             return False
         try:
             self.filter.load_state(saved.get("filter", {}))
+            restored_noise = None
+            if int(saved.get("noise_detection_version", 0) or 0) == self._noise_detection_version:
+                restored_noise = NoiseDetectionResult.load(saved.get("noise_detection"))
+            if restored_noise is not None:
+                self._noise_detection = restored_noise
             if self.filter.t_last is None:
                 return False
             self._calibrations = {
@@ -987,6 +1318,8 @@ class BayesianEnsembleSensor(SensorEntity):
             self._dynamics_bank = None
             self._dynamics = None
             self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
+            if self._gated_dynamics is not None:
+                self._clear_warmup_history()
             c = saved.get("characteristic") or {}
             self._characteristic = CharacteristicTimeEstimate.load(c) if c else None
             self._level_grid_step = max(float(saved.get("level_grid_step", 60.0)), 1.0)
@@ -996,8 +1329,10 @@ class BayesianEnsembleSensor(SensorEntity):
                     level_history.append((float(row[0]), float(row[1]), float(row[2])))
             self._level_history = deque(level_history[-self._level_history_max_points:], maxlen=self._level_history_max_points)
             self._last_characteristic_fit_ts = float(saved.get("last_characteristic_fit_ts", 0.0) or 0.0)
+            self._last_bias_history_refit_ts = float(saved.get("last_bias_history_refit_ts", 0.0) or 0.0)
             self._last_warmup_fit_ts = float(saved.get("last_warmup_fit_ts", 0.0) or 0.0)
-            self._last_processed_by_source = {                str(k): float(v) for k, v in (saved.get("last_processed_by_source", {}) or {}).items()
+            self._last_processed_by_source = {
+                str(k): float(v) for k, v in (saved.get("last_processed_by_source", {}) or {}).items()
             }
             if self._calibrations:
                 sigmas = sorted(c.sigma for c in self._calibrations.values() if c.sigma > 0)
@@ -1032,6 +1367,8 @@ class BayesianEnsembleSensor(SensorEntity):
         self._dynamics = None
         self._dynamics_bank = None
         self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
+        if self._gated_dynamics is not None:
+            self._clear_warmup_history()
         c = saved.get("characteristic") or {}
         if c:
             try:
@@ -1068,24 +1405,32 @@ class BayesianEnsembleSensor(SensorEntity):
             return None
 
     def _noise_model_params(self):
-        """Return only parameters specific to the active noise family.
+        """Return stochastic-family selection and independent quantization metadata."""
+        if self._noise_mode_cfg == "auto":
+            params = {
+                "confidence": round(float(self._noise_detection.confidence), 4),
+                "reason": self._noise_detection.reason,
+            }
+        else:
+            params = {"selection": "explicit"}
 
-        The generic per-observation uncertainty lives in measurement_sigma /
-        measurement_variance.  Keeping it out of this mapping makes the public
-        interface future-proof for auto-detected Poisson noise: ``noise_model``
-        names the family, while this mapping contains only family-specific
-        learned parameters.
-        """
-        if self._noise_model_name == "poisson" and self._last_source is not None:
-            cal = self._calibrations.get(self._last_source)
-            if cal is not None:
-                k = (cal.sigma * cal.sigma) / max(cal.typical_abs_level, 1e-9)
-                if math.isfinite(k) and k > 0:
-                    return {
-                        "variance_scale": round(float(k), 10),
-                        "estimated": True,
-                    }
-        return {}
+        if self._noise_mode_cfg == "auto" and self._noise_detection.quantization_step is not None:
+            q = float(self._noise_detection.quantization_step)
+            params["quantization_step"] = round(q, 10)
+            params["quantization_sigma"] = round(q / math.sqrt(12.0), 10)
+            params["quantization_confidence"] = round(
+                float(self._noise_detection.quantization_confidence), 4
+            )
+
+        if self._noise_model_name == "poisson":
+            k = self._noise_detection.poisson_scale
+            if k is None and self._last_source is not None:
+                cal = self._calibrations.get(self._last_source)
+                if cal is not None:
+                    k = (cal.sigma * cal.sigma) / max(cal.typical_abs_level, 1e-9)
+            if k is not None and math.isfinite(float(k)) and float(k) > 0:
+                params["variance_scale"] = round(float(k), 10)
+        return params
 
     def _remember_update_diag(self, out):
         """Cache diagnostics for the latest observation without touching math."""
@@ -1150,96 +1495,6 @@ class BayesianEnsembleSensor(SensorEntity):
             "startup_mode": self._startup_mode,
             "checkpoint_store_key": self._store_key,
             ATTR_FILTER_MODE: self._mode_name(),
-            # CPU/background diagnostics: scalar-only, cheap to expose.
-            **(lambda d: {
-                "cpu_diag_calibration_mode": d.get("mode"),
-                "cpu_diag_calibration_drift_score": round(
-                    float(d.get("drift_score", 0.0)), 3
-                ),
-                "cpu_diag_calibration_drift_sources": d.get(
-                    "drift_sources", {}
-                ),
-                "cpu_diag_calibration_window_s": round(
-                    float(d.get("window_s", 0.0)), 1
-                ),
-                "cpu_diag_calibration_interval_s": round(
-                    float(d.get("interval_s", 0.0)), 1
-                ),
-                "cpu_diag_calibration_last_refit_age_s": (
-                    None if d.get("last_refit_age_s") is None
-                    else round(float(d.get("last_refit_age_s")), 1)
-                ),
-                "cpu_diag_calibration_next_refit_due_s": round(
-                    float(d.get("next_refit_due_s", 0.0)), 1
-                ),
-                "cpu_diag_calibration_refit_runs": int(
-                    d.get("refit_runs", 0)
-                ),
-                "cpu_diag_calibration_refit_failures": int(
-                    d.get("refit_failures", 0)
-                ),
-                "cpu_diag_calibration_refit_last_ms": round(
-                    float(d.get("refit_last_ms", 0.0)), 1
-                ),
-                "cpu_diag_calibration_refit_max_ms": round(
-                    float(d.get("refit_max_ms", 0.0)), 1
-                ),
-                "cpu_diag_calibration_refit_last_points": int(
-                    d.get("refit_last_points", 0)
-                ),
-                "cpu_diag_calibration_residual_points": int(
-                    d.get("residual_points", 0)
-                ),
-                "cpu_diag_calibration_pair_points": int(
-                    d.get("pair_residual_points", 0)
-                ),
-            })(self._source_cal.scheduler_diagnostics(
-                float(
-                    self.filter.t_last
-                    or datetime.now(timezone.utc).timestamp()
-                ),
-                self._window_tau(),
-            ) if self._source_cal is not None else {}),
-            "cpu_diag_level_history_points": len(self._level_history),
-            "cpu_diag_warmup_history_points": sum(
-                len(v) for v in self._warmup_history.values()
-            ),
-            "cpu_diag_warmup_running": bool(
-                self._warmup_task is not None and not self._warmup_task.done()
-            ),
-            "cpu_diag_warmup_runs": int(self._diag_bg["warmup_runs"]),
-            "cpu_diag_warmup_failures": int(self._diag_bg["warmup_failures"]),
-            "cpu_diag_warmup_last_ms": round(float(self._diag_bg["warmup_last_ms"]), 1),
-            "cpu_diag_warmup_max_ms": round(float(self._diag_bg["warmup_max_ms"]), 1),
-            "cpu_diag_warmup_last_points": int(self._diag_bg["warmup_last_points"]),
-            "cpu_diag_warmup_refit_s": round(float(self._warmup_refit_s), 1),
-            "cpu_diag_characteristic_running": bool(
-                self._characteristic_task is not None
-                and not self._characteristic_task.done()
-            ),
-            "cpu_diag_characteristic_runs": int(self._diag_bg["characteristic_runs"]),
-            "cpu_diag_characteristic_failures": int(
-                self._diag_bg["characteristic_failures"]
-            ),
-            "cpu_diag_characteristic_last_ms": round(
-                float(self._diag_bg["characteristic_last_ms"]), 1
-            ),
-            "cpu_diag_characteristic_max_ms": round(
-                float(self._diag_bg["characteristic_max_ms"]), 1
-            ),
-            "cpu_diag_characteristic_last_points": int(
-                self._diag_bg["characteristic_last_points"]
-            ),
-            "cpu_diag_characteristic_refit_s": round(
-                float(self._characteristic_refit_s), 1
-            ),
-            "cpu_diag_save_runs": int(self._diag_bg["save_runs"]),
-            "cpu_diag_save_failures": int(self._diag_bg["save_failures"]),
-            "cpu_diag_save_last_ms": round(float(self._diag_bg["save_last_ms"]), 1),
-            "cpu_diag_save_max_ms": round(float(self._diag_bg["save_max_ms"]), 1),
-            "cpu_diag_save_last_bytes_est": int(
-                self._diag_bg["save_last_bytes_est"]
-            ),
             # ``noise_model_mode`` is the user's selection policy (auto /
             # gaussian / poisson); ``noise_model`` is the family actually in
             # use right now.  Auto is deliberately Gaussian-only for now, but
@@ -1253,8 +1508,17 @@ class BayesianEnsembleSensor(SensorEntity):
             # Full state is always [x,v,a,j]. Internal derivative units are per
             # second; publish human-scale per-hour diagnostics.
             ATTR_RATE_PER_HOUR: round(velocity * 3600.0, 10),
+            ATTR_RATE_STDDEV_PER_HOUR: round(
+                math.sqrt(max(float(self.filter.P[1, 1]), 0.0)) * 3600.0, 10
+            ),
             ATTR_CURVATURE_PER_HOUR2: round(acceleration * (3600.0 ** 2), 10),
+            ATTR_CURVATURE_STDDEV_PER_HOUR2: round(
+                math.sqrt(max(float(self.filter.P[2, 2]), 0.0)) * (3600.0 ** 2), 10
+            ),
             ATTR_JERK_PER_HOUR3: round(jerk * (3600.0 ** 3), 10),
+            ATTR_JERK_STDDEV_PER_HOUR3: round(
+                math.sqrt(max(float(self.filter.P[3, 3]), 0.0)) * (3600.0 ** 3), 10
+            ),
             ATTR_RATE_WEIGHT: round(float(eff_w[1]), 6) if len(eff_w) > 1 else 0.0,
             ATTR_CURVATURE_WEIGHT: round(float(eff_w[2]), 6) if len(eff_w) > 2 else 0.0,
             ATTR_JERK_WEIGHT: round(float(eff_w[3]), 6) if len(eff_w) > 3 else 0.0,
@@ -1447,17 +1711,25 @@ class BayesianEnsembleSensor(SensorEntity):
             self._attr_state_class = st.attributes.get("state_class")
             self._attr_icon = st.attributes.get("icon")
 
-    def _select_noise_model(self, st=None):
+    def _apply_noise_model(self):
+        """Apply configured or history-detected observation-noise family."""
         mode = self._noise_mode_cfg
-        # ``auto`` is intentionally conservative in 0.3.0 and therefore
-        # selects Gaussian.  The public mode/family split is already in place
-        # so a future history-based detector can select Poisson without a YAML
-        # or attribute-schema migration.  Explicit ``poisson`` remains
-        # available for count/rate-like sources.
-        if mode == "poisson":
+        if mode == "auto":
+            family = self._noise_detection.family
+        else:
+            family = mode
+
+        if family == "poisson":
+            k = self._noise_detection.poisson_scale
+            if k is not None and math.isfinite(float(k)) and float(k) > 0:
+                self._poisson_noise.set_scale(float(k))
             self.filter.noise_model = self._poisson_noise
             self._noise_model_name = "poisson"
             return "poisson"
+
+        # Quantization is an independent observation property.  It is already
+        # present in the empirically learned source sigma, so q^2/12 is not
+        # added again here.
         self.filter.noise_model = self._gaussian_noise
         self._noise_model_name = "gaussian"
         return "gaussian"

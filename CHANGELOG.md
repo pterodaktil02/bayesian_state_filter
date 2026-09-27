@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.1 - 2026-09-27
+
+### Multi-source fusion
+- Reworked live multi-source updates around a persistent source window instead of treating the latest source event as the whole ensemble observation.
+- Every source is transported to the current time before fusion.
+- Slow/event-driven sensors are no longer penalized merely for publishing slowly: extra uncertainty starts only after the source exceeds its normal reporting cadence.
+- Source age now increases prediction variance rather than directly changing an arbitrary source weight.
+- Added robust variance-aware fusion of the current source snapshot before the common state update.
+- Separated state publication cadence from heavy diagnostic attribute refresh so the visible estimate can remain smooth without rebuilding large attribute payloads on every sample.
+
+### Source metrology
+- Bias is now treated as a slow source property and is estimated from the full configured `history_days` horizon, using only the quietest process segments.
+- Dynamic sections are excluded from bias fitting because source response delays during real physical changes must not be learned as zero-offset errors.
+- Added a coarse long-horizon bias grid to keep week-long recalibration computationally bounded.
+- Applying a new bias solution preserves the current fused level, avoiding artificial output steps during recalibration.
+- Source `sigma` is now also treated as a slow metrology parameter: it is learned from long Recorder history and remains fixed between calibration passes.
+- Multi-source sigma calibration uses time-aligned pairwise residuals with bounded anchor sampling.
+- Single-source sigma estimation uses local-linear residuals with a quantization floor, avoiding the old first-difference artefact on quantized signals.
+
+### Dynamics
+- Replaced single-timescale-driven process-noise fitting with direct multi-horizon identification of both high-order process noise and independent level random-walk diffusion.
+- Training scores predictive residuals over 1, 2, 4, 8, 16 and 32 natural steps.
+- Long histories keep several contiguous native-cadence blocks distributed over the Recorder horizon so fast dynamics remain visible without optimizing over every raw sample.
+- `gated_timescale_s` is now a secondary diagnostic derived from the fitted process noise instead of the quantity that directly determines it.
+- Added an independent level random-walk term so the level can follow persistent common motion even when derivative confidence is near zero.
+- Changed derivative gating to smooth order-dependent exponential suppression:
+  - `w_v = g_1(c_v)`
+  - `w_a = w_v * g_2(c_a)`
+  - `w_j = w_a * g_3(c_j)`
+  - `g_k(c) = exp(-k * (1-c) / c)`
+- Higher derivatives therefore require progressively stronger posterior evidence without hard thresholds or state-machine hysteresis.
+
+### Noise model
+- Added automatic noise-family diagnostics with Gaussian vs scaled-Poisson classification.
+- Quantization is represented independently from the stochastic family through `quantization_step`, `quantization_sigma` and `quantization_confidence`.
+- A quantized signal is no longer implicitly classified as Gaussian or Poisson solely because it is quantized.
+
+### Performance and persistence
+- Heavy source calibration remains outside the per-sample hot path and is executed through the Home Assistant executor.
+- Warmup history is bounded/cleared after training, and checkpoint persistence reuses cached heavy summaries instead of recomputing them on every save.
+- Reduced public diagnostics by removing CPU-profiler attributes while keeping process and source-quality information.
+- Checkpoint schema was advanced for the new process-noise semantics; the first start after upgrading to 0.4.1 may require one full Recorder bootstrap.
+
+### Fixes
+- Fixed duplicated residual evidence from appending all fresh sources on every source event.
+- Fixed source-event timestamp handling and stale snapshot semantics.
+- Fixed `numpy` import in the new robust ensemble fusion path.
+- Fixed startup/live calibration inconsistencies that allowed recent process motion to overwrite long-history source statistics.
+- Fixed runtime behavior where dynamic derivative terms could create ringing while the level process itself remained too rigid.
+
 ## 0.4.0 - 2026-09-24
 
 ### Root cause
@@ -75,10 +125,9 @@ Review hardening before the first public push:
 - name key numerical/freshness constants in `const.py` without changing their values;
 - add regression tests for known-sigma pairwise calibration, history order invariance and live time-ordering/backdating policy;
 - document roadmap and deferred structural work;
-
-- Added per-source live diagnostics in `source_health`: raw/corrected value, innovation, z-score and robust weight.
-- Added explicit `outliers` counter next to `outlier_rate`.
-- No change to Bayesian filter math relative to 0.2.1.5.
+- add per-source live diagnostics in `source_health`: raw/corrected value, innovation, z-score and robust weight;
+- add explicit `outliers` counter next to `outlier_rate`;
+- no change to Bayesian filter math relative to 0.2.1.5.
 
 ## 0.2.1.5
 

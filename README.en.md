@@ -1,23 +1,23 @@
 # Bayesian State Filter for Home Assistant
 
-Version: **0.4.0**
+Version: **0.4.1**
 
 [Русское описание](README.md)
 
 `bayesian_state_filter` is a Home Assistant custom integration for fusing multiple asynchronous numeric sensors into one robust estimate of a shared latent scalar process.
 
-Instead of simple averaging, it jointly estimates:
+Instead of simple averaging, the filter jointly estimates:
 
 - process level;
 - local rate of change;
 - acceleration;
 - jerk;
-- relative bias of each source;
-- effective observation standard deviation (`sigma`) of each source;
-- confidence in each incoming measurement;
+- relative source bias;
+- characteristic observation variance of each source;
+- uncertainty of the current estimate;
 - confidence in the derivative terms of the dynamic model.
 
-Typical use cases include temperature, pressure, humidity, background radiation, and other continuous or quasi-continuous quantities measured by several sources in compatible units.
+Typical use cases include temperature, atmospheric and duct pressure, humidity, background radiation, and other continuous or quasi-continuous quantities.
 
 > This is unrelated to Home Assistant's built-in `bayesian` integration, which estimates event probability and produces a binary sensor. This project estimates a continuous numeric state.
 
@@ -31,96 +31,141 @@ The state is always:
 
 where `x` is level, `v` is rate, `a` is acceleration and `j` is jerk.
 
-The model uses an integrated Wiener process driven by snap noise. The same confidence-gated transition matrix is applied to both the state mean and covariance. This prevents poorly observed hidden derivatives from destabilizing the covariance through ungated cross-couplings.
+The model uses an integrated Wiener process. The same confidence-gated transition matrix is applied to both state mean and covariance, so weakly observed hidden derivatives cannot destabilize prediction through ungated cross-covariances.
 
 ### Derivative confidence
 
-For every derivative, the filter computes a posterior z-score:
+For every derivative, the filter computes the posterior z-score:
 
 ```text
 z_d = |d| / sigma_d
 ```
 
-It is mapped to posterior confidence as:
+and base confidence:
 
 ```text
 c(z) = erf(|z| / sqrt(2))
 ```
 
-Effective weights are hierarchical:
+Since 0.4.1, higher-order derivatives are suppressed more strongly when their evidence is weak:
 
 ```text
-w_v = c_v
-w_a = c_v * c_a
-w_j = c_v * c_a * c_j
+g_k(c) = exp(-k * (1-c) / c)
+
+w_v = g_1(c_v)
+w_a = w_v * g_2(c_a)
+w_j = w_a * g_3(c_j)
 ```
 
-Therefore:
+Weak acceleration and jerk therefore collapse rapidly toward zero influence, while strongly supported derivatives pass smoothly without hard thresholds or mode switches.
+
+## Robust multi-source fusion
+
+In multi-source mode the integration keeps the latest valid state of every source and rebuilds a common estimate at the current time whenever a source updates.
+
+For every source it uses:
+
+- latest measurement;
+- `bias`;
+- characteristic observation variance `sigma^2`;
+- typical reporting interval `median_dt_s`;
+- age of the latest measurement.
+
+A slow-reporting source is not considered inaccurate merely because it reports slowly. No extra age uncertainty is added before the source exceeds its normal reporting cadence. Beyond that point the uncertainty of what the source would read now grows:
 
 ```text
-1 >= w_v >= w_a >= w_j >= 0
+R_eff = R_sensor + R_age
 ```
 
-If rate is not confidently observed, acceleration and jerk cannot have stronger influence on the predicted trajectory.
+This distinction is important for battery-powered and event-driven sensors: reporting cadence and measurement accuracy are different properties.
 
-### Robust multi-source fusion
+After source values are transported to a common time, the integration performs robust variance-aware fusion. A single fused observation with its own variance then updates the state filter.
 
-Each incoming measurement updates the common state independently; sources are not averaged before the Bayesian update.
+## Source calibration
 
-For every source, the integration estimates:
+### Bias
 
-- relative `bias`;
-- effective observation standard deviation `sigma`;
-- typical update interval;
-- innovation (measurement residual);
-- innovation z-score;
-- Student-t robust weight;
-- outlier statistics.
+`bias` is treated as a slow metrology parameter. It is not relearned from the current process motion.
 
-The Student-t updater may assign a weight slightly above 1 to a well-aligned inlier and smoothly downweight outliers.
+In 0.4.1 bias is estimated from the full `history_days` horizon, but only from the quietest parts of that history. Dynamic sections are excluded because sensors can respond differently to the same physical change and that transient disagreement is not a zero-offset error.
 
-### Dynamics identification
+A coarse long-horizon time grid is used for bias fitting. This preserves the slow metrology information while making week-long recalibration practical.
 
-`q/timescale` are identified from Recorder history on the process's natural time grid. Validation uses 1-2 natural process steps instead of an arbitrary long forecast horizon.
+Applying a new set of source biases preserves the current fused level, so recalibration itself does not inject an artificial step into the output state.
 
-RMSE is a diagnostic of the fitted dynamics, not a definition of derivative confidence. Confidence is derived only from the posterior state and covariance.
+Available `bias_anchor` modes:
 
-### Fast restart and checkpoints
+- `median` - robust relative zero gauge;
+- `mean` - linear sum-to-zero gauge;
+- `passport` - absolute prior anchor derived from model datasheet accuracy, with one robust vote per model family regardless of the number of identical physical sensors.
+
+### Sigma
+
+Source `sigma` is also treated as a slow property of the measurement channel. It is learned from long Recorder history and is not continuously relearned from the live window.
+
+Multi-source setups use time-aligned pairwise calibration. A single-source setup uses a local-linear residual estimator so ordinary process slope is not misclassified as measurement noise.
+
+Current process scatter does not immediately change `sigma_sensor`; runtime changes only age-related uncertainty and the resulting fused ensemble variance.
+
+## Dynamics identification
+
+Version 0.4.1 no longer derives process noise from one fitted time constant.
+
+It identifies separately:
+
+```text
+q_process
+level_q_process
+```
+
+from predictive residuals at multiple horizons:
+
+```text
+1, 2, 4, 8, 16, 32 natural steps
+```
+
+For long histories, several contiguous native-cadence blocks are retained across the full horizon. This preserves fast process behavior without making a week of 1 Hz data an unnecessarily large optimization problem.
+
+`gated_timescale_s` is now a secondary diagnostic derived from the fitted process noise rather than a control parameter. The separate slow `characteristic_time_s` diagnostic may be `null` when no characteristic time is identifiable above the noise floor.
+
+## Automatic noise detection
+
+`noise_model: auto` treats stochastic family and quantization as independent properties.
+
+The active stochastic family is reported as:
+
+```text
+noise_model: gaussian | poisson
+```
+
+Detected quantization is reported separately through:
+
+```text
+quantization_step
+quantization_sigma
+quantization_confidence
+```
+
+A quantized output is not automatically Poisson. Count-derived and scaled-count signals can use the Poisson-like model whose variance scales with level.
+
+## Fast restart and checkpoints
 
 The integration writes a checkpoint to Home Assistant Store every **30 minutes**.
 
-The checkpoint contains:
-
-- `[x, v, a, j]`;
-- covariance `P`;
-- learned `q/timescale`;
-- source calibration;
-- characteristic-time diagnostics;
-- Recorder watermarks;
-- checkpoint schema version.
+The checkpoint contains `[x, v, a, j]`, covariance, process-noise parameters, source calibration, diagnostics and Recorder watermarks.
 
 After restart:
 
 ```text
 load checkpoint
 -> read Recorder tail after the saved watermark
--> replay the tail through the normal filter path
+-> replay it through the normal filter path
 -> switch to live mode
 ```
 
-A full multi-day bootstrap is only required when the checkpoint is missing, corrupted or schema-incompatible. Online source calibration is not recomputed on every sample; expensive refits are scheduled adaptively from drift-monitor state.
+A full bootstrap is required only when the checkpoint is missing or incompatible. Version 0.4.1 uses a new checkpoint schema because process-noise semantics changed.
 
-## Online source calibration
-
-Each observation performs the normal filter update plus a cheap drift monitor. Re-estimation of source `bias/sigma` over the historical window runs separately and adaptively: infrequently for stable sources and more often when drift is detected.
-
-Drift is evaluated relative to each source's own baseline rather than a single global threshold. Scheduler state is persisted in the checkpoint.
-
-Three common-bias gauges are available through `bias_anchor`:
-
-- `median` - robust relative zero gauge;
-- `mean` - linear sum-to-zero gauge;
-- `passport` - an absolute prior-based anchor derived from model datasheet accuracy, with one robust vote per model family regardless of the number of identical physical sensors.
+Heavy Recorder reads and calibration work stay outside the per-sample hot path; CPU-heavy work is dispatched through the Home Assistant executor.
 
 ## Installation
 
@@ -187,18 +232,16 @@ Main options:
 
 | Option | Default | Purpose |
 |---|---:|---|
-| `history_days` | `7` | Recorder history used for startup calibration and dynamics identification |
+| `history_days` | `7` | Recorder history used for calibration and dynamics identification |
 | `save_every_s` | `1800` | Checkpoint interval |
 | `student_nu` | `4` | Student-t degrees of freedom |
-| `characteristic_refit_s` | `21600` | Refitting interval for the slow level characteristic time |
-| `warmup_refit_s` | `21600` | Minimum retry interval for dynamics warmup while it is still unidentified |
-| `bias_anchor` | `median` | Common-bias anchor: `median`, `mean` or `passport` |
+| `characteristic_refit_s` | `21600` | Slow characteristic-time diagnostic refit interval |
+| `warmup_refit_s` | `21600` | Minimum retry interval for dynamics training |
+| `bias_anchor` | `median` | `median`, `mean` or `passport` |
 | `noise_model` | `auto` | `auto`, `gaussian` or `poisson` |
 | `diagnostics` | `compact` | `compact`, `full`, `debug`, `verbose` |
 
 ### `passport` anchoring example
-
-When `bias_anchor: passport` is used, sources that participate in the absolute anchor must declare a model, and that model must provide `absolute_accuracy`:
 
 ```yaml
 sensor:
@@ -224,11 +267,9 @@ sensor:
       bias_anchor: passport
 ```
 
-Multiple sensors of the same model do not create multiple independent absolute-reference votes; the model family contributes one robust vote.
+Multiple sensors of the same model do not create multiple independent absolute-reference votes; one model family contributes one robust vote.
 
 ## Main attributes
-
-The resulting sensor exposes, among others:
 
 ```text
 stddev
@@ -248,11 +289,14 @@ gated_timescale_s
 gated_local_rmse
 gated_local_rmse_step1
 gated_local_rmse_step2
+
+characteristic_time_s
+characteristic_time_confidence
+characteristic_time_status
+characteristic_time_identifiable
 ```
 
-Rate, curvature, and jerk are exposed in per-hour units for readability, while the internal state uses per-second time units.
-
-Per-source diagnostics are available under `source_health`:
+Per-source diagnostics under `source_health` include:
 
 ```text
 model
@@ -264,15 +308,16 @@ last_z_score
 robust_weight
 ```
 
-`characteristic_time_s` remains a separate slow-timescale estimate of the level process. It is not expected to match `gated_timescale_s`, which belongs to the local state-space model.
+Rate, curvature and jerk are exposed in per-hour units for readability; the internal model uses seconds.
 
 ## Practical notes
 
-- With `median` or `mean` anchoring, `bias` is relative: a systematic error shared by all sources is not identifiable from the ensemble alone. `passport` adds an absolute prior from model datasheet accuracy, but it is still a prior, not a physical reference standard.
-- `sigma` is the effective observation standard deviation with respect to the latent state, not the sensor datasheet accuracy.
-- A high `robust_weight` indicates an inlier; a low one indicates an outlier or temporary disagreement with the common process.
-- Large `curvature_per_hour2` or `jerk_per_hour3` values alone are not necessarily problematic because local derivatives are rescaled from seconds to hours. Inspect them together with derivative weights and local RMSE.
-- When dynamics are not identifiable above the noise floor, derivative weights should collapse toward zero and the model naturally behaves as a level estimator.
+- `bias` and `sigma` are slow source parameters; current physical motion should not relearn them every second.
+- Under `median`/`mean` anchoring, a common systematic offset shared by all sources is not identifiable. `passport` adds a prior, not a physical reference standard.
+- A source is not penalized merely for reporting slowly. Age increases uncertainty about its current value.
+- Large derivative values are not meaningful on their own; inspect `*_z` and `*_weight` as well.
+- When dynamics are not identifiable above noise, derivative weights should collapse toward zero and the filter naturally becomes a robust level estimator.
+- `characteristic_time_s: null` with `insufficient_signal` is a valid result: the filter should not invent a process timescale that is not observable.
 
 ## Layout
 
@@ -287,8 +332,10 @@ custom_components/
     strings.json
     translations/
     core/
+      dynamics.py
       filter.py
       gated_training.py
+      noise_detection.py
       noise_models.py
       process_noise.py
       state_models.py

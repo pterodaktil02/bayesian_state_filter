@@ -17,11 +17,15 @@ class IntegratedWienerProcessNoise:
     algebra, not in the physical parameter.
     """
 
-    def __init__(self, order: int, q: float = 0.0):
+    def __init__(self, order: int, q: float = 0.0, level_q: float = 0.0):
         self.order = int(order)
         if self.order < 0 or self.order > 3:
             raise ValueError("order must be between 0 and 3")
         self.q = self._clean_q(q)
+        # Independent random-walk diffusion of the level itself [x^2 / s].
+        # This prevents covariance collapse when higher derivatives are gated
+        # out: an x-v-a-j model must still allow the physical level to move.
+        self.level_q = self._clean_q(level_q)
 
     @staticmethod
     def _clean_q(value: float) -> float:
@@ -36,13 +40,17 @@ class IntegratedWienerProcessNoise:
         size = n + 1
         dt = max(float(dt), np.finfo(float).tiny)
         Q = np.zeros((size, size), dtype=float)
-        if qv == 0.0:
-            return Q
-        for i in range(size):
-            for j in range(size):
-                power = 2 * n + 1 - i - j
-                denom = power * math.factorial(n - i) * math.factorial(n - j)
-                Q[i, j] = qv * (dt ** power) / denom
+        if qv != 0.0:
+            for i in range(size):
+                for j in range(size):
+                    power = 2 * n + 1 - i - j
+                    denom = power * math.factorial(n - i) * math.factorial(n - j)
+                    Q[i, j] = qv * (dt ** power) / denom
+        # Orthogonal level random walk.  Unlike snap-driven Q[0,0] ~ dt^7,
+        # this contributes at every sample and keeps level uncertainty honest
+        # even while v/a/j confidence gates are near zero.
+        if self.level_q > 0.0:
+            Q[0, 0] += self.level_q * dt
         return Q
 
 

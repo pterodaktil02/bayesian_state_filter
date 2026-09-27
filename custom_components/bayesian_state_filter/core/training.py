@@ -12,6 +12,7 @@ import numpy as np
 
 from .dynamics import DynamicsBank, DynamicsEstimate
 from .variogram import CharacteristicTimeEstimate, estimate_characteristic_time
+from .noise_detection import detect_quantization
 
 
 def _median(values, default=0.0):
@@ -271,6 +272,65 @@ def _temporal_sigma(seq):
     return _mad(diffs) / math.sqrt(2.0)
 
 
+def _single_source_sigma(seq):
+    """Estimate observation sigma without charging local process slope to noise.
+
+    For one physical source there is no cross-sensor pair from which to cancel
+    the latent process.  First differences are a poor substitute because any
+    genuine slope is counted as measurement noise.  Instead, compare every
+    interior sample with the linear interpolation of its two temporal
+    neighbours.  For locally linear motion the process term cancels; only
+    observation noise remains.  Each residual is normalized by its exact
+    white-noise variance factor, so irregular sampling is handled naturally.
+
+    Regime changes and isolated disturbances become a small number of large
+    residuals and are suppressed by the MAD estimator.  A detected value
+    lattice supplies the unavoidable quantization floor q/sqrt(12).
+    """
+    seq = _clean_history(seq)
+    if len(seq) < 5:
+        return _temporal_sigma(seq)
+
+    # Bound one-time bootstrap work while retaining the full time span.
+    if len(seq) > 50000:
+        original_last = seq[-1]
+        stride = int(math.ceil(len(seq) / 50000.0))
+        seq = seq[::stride]
+        if seq[-1][0] != original_last[0]:
+            seq.append(original_last)
+
+    median_dt = max(_median_dt(seq), 1e-9)
+    normalized = []
+    for i in range(1, len(seq) - 1):
+        t0, z0 = seq[i - 1]
+        t1, z1 = seq[i]
+        t2, z2 = seq[i + 1]
+        left = t1 - t0
+        right = t2 - t1
+        span = t2 - t0
+        if left <= 0 or right <= 0 or span <= 0:
+            continue
+        # Long gaps are not a local linear-noise experiment anymore.
+        if left > 6.0 * median_dt or right > 6.0 * median_dt:
+            continue
+        w = left / span
+        predicted = (1.0 - w) * z0 + w * z2
+        residual = z1 - predicted
+        # Var[e1 - ((1-w)e0 + w e2)] = sigma^2 * factor^2.
+        factor = math.sqrt(1.0 + (1.0 - w) ** 2 + w ** 2)
+        normalized.append(residual / max(factor, 1e-12))
+
+    sigma = _mad(normalized) if len(normalized) >= 16 else 0.0
+    if not math.isfinite(sigma) or sigma <= 0:
+        sigma = _temporal_sigma(seq)
+
+    values = [float(z) for _, z in seq if math.isfinite(float(z))]
+    qstep, qconf = detect_quantization(values)
+    if qstep is not None and qconf >= 0.8:
+        sigma = max(float(sigma), float(qstep) / math.sqrt(12.0))
+    return max(float(sigma), 0.0)
+
+
 def _pair_match_tolerance(dt_a: float, dt_b: float, tau: float | None) -> float:
     """Maximum time skew for a pairwise calibration observation.
 
@@ -323,6 +383,16 @@ def _nearest_pair_residuals(seq_a, seq_b, *, bias_a=0.0, bias_b=0.0,
         peers = [p for p in peers if p[0] >= cutoff - max(dt_a, dt_b) and p[0] <= end + max(dt_a, dt_b)]
     if len(anchors) < 2 or len(peers) < 2:
         return [], 0.0
+
+    # Sigma is a slow metrology parameter trained over the full configured
+    # history.  Tens of thousands of raw pair samples are already far more
+    # than a robust MAD needs; walking every 1 Hz point for a week only burns
+    # CPU.  Uniformly subsample the *anchor* stream, keeping the original raw
+    # values (no averaging, hence no artificial reduction of sensor noise).
+    max_anchor_samples = 20000
+    if len(anchors) > max_anchor_samples:
+        stride = int(math.ceil(len(anchors) / max_anchor_samples))
+        anchors = anchors[::stride]
 
     peer_times = [p[0] for p in peers]
     tol = _pair_match_tolerance(dt_a, dt_b, tau)
@@ -483,6 +553,106 @@ def _make_grid(histories, step, freshness):
     return grid
 
 
+
+def _make_bias_grid(histories, dts):
+    """Build a coarse full-horizon grid dedicated to relative-bias fitting.
+
+    Bias is a slow metrology parameter.  Sub-second/second samples do not add
+    useful bias information, but they make a week-long refit unnecessarily
+    expensive and over-represent fast sources.  Use the complete configured
+    history horizon, binned to a cadence between 60 and 300 seconds, then let
+    _stable_bias_grid select only the quietest portions.
+    """
+    if not histories:
+        return []
+    typical_dt = max(_median(dts.values(), 60.0), 1.0)
+    step = min(300.0, max(60.0, typical_dt))
+    freshness = {k: max(3.0 * float(dts[k]), 3.0 * step) for k in histories}
+    return _make_grid(histories, step, freshness)
+
+
+def _stable_bias_grid(grid, *, fraction: float = 0.40, min_points: int = 40):
+    """Return the quietest long-history grid points for relative-bias fitting.
+
+    Relative bias is a metrology property and must not be estimated while the
+    common physical process is moving.  Different sources have different
+    latency/report cadence, so dynamic sections create apparent pair offsets.
+
+    We rank grid points by a centred common-process slope estimated from the
+    median across currently available sources and retain the quietest fraction
+    of the *entire* Recorder horizon.  This is unit-agnostic and deliberately
+    uses the configured long history rather than a short live window.
+    """
+    rows = []
+    for t, snap in grid:
+        if len(snap) < 2:
+            continue
+        rows.append((float(t), snap, float(_median(snap.values()))))
+    if len(rows) < max(int(min_points), 3):
+        return [(t, snap) for t, snap, _ref in rows]
+
+    motion = []
+    for i, (t, _snap, _ref) in enumerate(rows):
+        if i == 0:
+            t0, r0 = rows[i][0], rows[i][2]
+            t1, r1 = rows[i + 1][0], rows[i + 1][2]
+        elif i == len(rows) - 1:
+            t0, r0 = rows[i - 1][0], rows[i - 1][2]
+            t1, r1 = rows[i][0], rows[i][2]
+        else:
+            t0, r0 = rows[i - 1][0], rows[i - 1][2]
+            t1, r1 = rows[i + 1][0], rows[i + 1][2]
+        dt = max(float(t1) - float(t0), 1e-9)
+        motion.append(abs(float(r1) - float(r0)) / dt)
+
+    keep_n = max(int(min_points), int(math.ceil(len(rows) * float(fraction))))
+    keep_n = min(keep_n, len(rows))
+    order = sorted(range(len(rows)), key=lambda i: (motion[i], rows[i][0]))
+    keep = set(order[:keep_n])
+    return [(rows[i][0], rows[i][1]) for i in range(len(rows)) if i in keep]
+
+
+def estimate_biases_from_history(histories, *, bias_anchor="median",
+                                   source_models=None, model_accuracy=None,
+                                   huber_delta: float = 1.345):
+    """Estimate source biases from quiet sections of the full supplied history.
+
+    The caller controls the horizon by the history it supplies (normally
+    ``bayes.history_days``).  No short-window/live evidence is used here.
+    """
+    histories = {k: _clean_history(v) for k, v in histories.items()}
+    histories = {k: v for k, v in histories.items() if v}
+    if not histories:
+        return {}, 0, 0
+    if len(histories) == 1:
+        src = next(iter(histories))
+        return {src: 0.0}, len(histories[src]), len(histories[src])
+
+    dts = {k: max(_median_dt(v), 1.0) for k, v in histories.items()}
+    grid = _make_bias_grid(histories, dts)
+    stable_grid = _stable_bias_grid(grid)
+    residuals = {k: [] for k in histories}
+    for _t, snap in stable_grid:
+        if len(snap) < 2:
+            continue
+        ref = _median(snap.values())
+        for src, z in snap.items():
+            residuals[src].append(float(z) - float(ref))
+
+    tmp = {}
+    for src, seq in histories.items():
+        bias = _median(residuals[src], 0.0) if residuals[src] else 0.0
+        tmp[src] = SourceCalibration(
+            bias=float(bias), sigma=1.0, median_dt=float(dts[src]),
+            typical_abs_level=max(_median([abs(z) for _, z in seq], 1.0), 1e-9),
+            samples=len(seq),
+        )
+    normalize_bias_gauge(
+        tmp, mode=bias_anchor, source_models=source_models,
+        model_accuracy=model_accuracy, huber_delta=huber_delta,
+    )
+    return {src: float(c.bias) for src, c in tmp.items()}, len(stable_grid), len(grid)
+
 def _build_fused(grid, calib):
     """Fuse a temporal grid using fixed per-source bias/sigma calibrations."""
     fused = []
@@ -623,9 +793,15 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
         if realised_dts:
             step = max(_median(realised_dts, step), 1.0)
 
-    # Pass 1: spatial reference without assuming source quality.
+    # Pass 1: estimate relative bias only on the quietest parts of the full
+    # configured Recorder horizon.  Bias gets its own coarse 60..300 s grid:
+    # it is a slow metrology parameter, and second-by-second points merely
+    # overweight fast sensors and make a week-long refit expensive. Dynamic
+    # sections are intentionally excluded because different sensor response
+    # times turn real process motion into false bias.
+    bias_grid = _stable_bias_grid(_make_bias_grid(histories, dts))
     residuals = {k: [] for k in histories}
-    for _, snap in grid:
+    for _, snap in bias_grid:
         if len(snap) < 2:
             continue
         ref = _median(snap.values())
@@ -638,9 +814,14 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
         # Provisional sigma is deliberately conservative and is used only for
         # the preliminary fusion/time-scale fit.  The published per-source
         # sigma is replaced below by time-aligned pairwise calibration.
-        sigma = _mad(residuals[src], center=bias) if residuals[src] else _temporal_sigma(seq)
-        if sigma <= 0:
-            sigma = _temporal_sigma(seq)
+        if residuals[src]:
+            sigma = _mad(residuals[src], center=bias)
+            if sigma <= 0:
+                sigma = _temporal_sigma(seq)
+        else:
+            # True single-source path: remove local linear process motion before
+            # estimating observation noise.
+            sigma = _single_source_sigma(seq)
         level_scale = _median([abs(z) for _, z in seq], 1.0)
         numerical_floor = max(level_scale * 1e-6, 1e-8)
         sigma = max(sigma, numerical_floor)
@@ -654,42 +835,33 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
         model_accuracy=model_accuracy, huber_delta=huber_delta,
     )
 
-    # Pass 2a: provisional fusion using the long-history calibration.  The
-    # long history is excellent for relative bias, but its spatial residual
-    # spread can be badly inflated by old operating regimes, spatial thermal
-    # gradients, SysID runs, maintenance incidents, etc.  We therefore use it
-    # only to obtain a preliminary level-process time scale.
-    fused = _build_fused(grid, calib)
-
-    if len(fused) < 20:
-        span = fused[-1][0] - fused[0][0] if len(fused) >= 2 else 0.0
-        return TrainingResult(calib, None, None, None, fused, step, span)
-
-    span = fused[-1][0] - fused[0][0]
-
-    # Estimate a preliminary time scale, then recalibrate source *noise* from
-    # a recent window comparable to the online calibrator (about 3 tau).
-    # Bias remains a long-history quantity; sigma is intentionally local so a
-    # restart does not resurrect obsolete week-old operating regimes.
-    preliminary_characteristic = estimate_characteristic_time(
-        fused,
-        tau_points=max(int(tau_points) * 3, 32),
-        tau_min_s=characteristic_tau_min_s,
-        tau_max_s=characteristic_tau_max_s,
-    )
-    recent_window = _calibration_window_s(
-        preliminary_characteristic, dts=dts, span=span
-    )
+    # Pass 2: source sigma is also a slow metrology parameter.  Estimate it
+    # from time-aligned raw sensor pairs across the full configured Recorder
+    # horizon.  Do not let a short recent process episode redefine sensor
+    # noise at every restart.  Pairwise matching cancels the common physical
+    # process; anchor subsampling above keeps week-long histories cheap.
     startup_pair_rows = _recalibrate_recent_sigmas(
-        histories, calib, recent_window_s=recent_window,
-        tau=(preliminary_characteristic.tau if preliminary_characteristic is not None else None),
+        histories, calib, recent_window_s=None, tau=None,
     )
-    for c in calib.values():
-        c.calibration_window_s = float(recent_window)
 
-    # Rebuild observation variances with the recent source-noise calibration,
-    # then fit the published characteristic time and predictive dynamics.
+    span = max(
+        (seq[-1][0] for seq in histories.values() if seq), default=0.0
+    ) - min(
+        (seq[0][0] for seq in histories.values() if seq), default=0.0
+    )
+    span = max(float(span), 0.0)
+    for c in calib.values():
+        c.calibration_window_s = float(span)
+
+    # Rebuild fused history with the stable long-history sigma.
     fused = _build_fused(grid, calib)
+    if len(fused) < 20:
+        fspan = fused[-1][0] - fused[0][0] if len(fused) >= 2 else 0.0
+        return TrainingResult(calib, None, None, None, fused, step, fspan)
+
+    # Characteristic time remains a diagnostic description of the process.
+    # It no longer controls Q; process noise is fitted directly from
+    # multi-horizon predictive residuals in core.gated_training.
     characteristic = estimate_characteristic_time(
         fused,
         tau_points=max(int(tau_points) * 3, 32),
@@ -705,7 +877,7 @@ def calibrate_history(histories: dict[str, list[tuple[float, float]]], *,
     return TrainingResult(
         calib, None, None, characteristic, fused, step, span,
         startup_pair_rows=list(startup_pair_rows),
-        calibration_window_s=float(recent_window),
+        calibration_window_s=float(span),
         dynamics_points=dynamics_points,
     )
 
@@ -771,6 +943,17 @@ class OnlineSourceCalibrator:
         self._drift_score: float = 0.0
         self._drift: dict[str, dict[str, float]] = {}
 
+        # Live calibration evidence is deliberately bounded and time-decimated.
+        # Robust bias/noise estimates do not benefit from hundreds of thousands
+        # of strongly autocorrelated 1 Hz samples over a multi-day window.
+        self._evidence_max_points_per_series: int = 10000
+
+        # Persistence must not rescan/sort every live residual deque on every
+        # checkpoint save.  Heavy robust pair summaries are refreshed only by
+        # the scheduled calibration refit and reused by cheap checkpoint saves.
+        self._compact_rows_cache = list(self.startup_pair_rows.values())
+        self._compact_rows_time: float | None = None
+
 
     def dump_compact(self, now: float, tau: float) -> dict:
         """Persist compact rolling calibration evidence.
@@ -786,11 +969,19 @@ class OnlineSourceCalibrator:
             3600.0,
         )
         window = self.calibration_window_s or dynamic_window
-        live_rows, _counts, _spans = self._pair_rows_live(float(now), window)
-        rows = self._combine_startup_and_live_rows(live_rows, now=float(now), window=window)
+        # Pair MAD/variance computation is intentionally NOT done here.
+        # A save can happen every ~30 minutes; rescanning growing deques at
+        # every save recreated uptime-dependent CPU.  Refit owns that work.
+        rows = list(self._compact_rows_cache)
+        evidence_snapshot_time = (
+            float(self._compact_rows_time)
+            if self._compact_rows_time is not None
+            else float(now)
+        )
         return {
             "startup_pair_rows": [list(r) for r in rows],
             "calibration_window_s": float(window),
+            "evidence_snapshot_time": evidence_snapshot_time,
             "cache": {k: [float(v[0]), float(v[1])] for k, v in self.cache.items()},
             "last_updated_source": self._last_updated_source,
             "snapshot_time": float(now),
@@ -826,13 +1017,19 @@ class OnlineSourceCalibrator:
             except Exception:
                 continue
         obj._last_updated_source = data.get("last_updated_source")
-        # Compact rows represent the rolling window at checkpoint time.  Age
-        # that historical evidence across downtime/catch-up exactly as if the
-        # process had never restarted.
+        # Compact rows may intentionally be older than the checkpoint itself:
+        # they are refreshed by scheduled heavy refits, not by every save.
+        # Preserve their own timestamp so aging remains correct after restart.
         try:
-            obj._online_start_time = float(data.get("snapshot_time"))
+            evidence_ts = float(
+                data.get("evidence_snapshot_time", data.get("snapshot_time"))
+            )
+            obj._online_start_time = evidence_ts
+            obj._compact_rows_time = evidence_ts
         except (TypeError, ValueError):
             obj._online_start_time = None
+            obj._compact_rows_time = None
+        obj._compact_rows_cache = list(obj.startup_pair_rows.values())
 
         try:
             checkpoint_ts = float(data.get("snapshot_time", 0.0) or 0.0)
@@ -905,6 +1102,8 @@ class OnlineSourceCalibrator:
                 self.calibration_window_s = w
         # New startup evidence defines a new rolling-window origin.
         self._online_start_time = None
+        self._compact_rows_cache = list(self.startup_pair_rows.values())
+        self._compact_rows_time = None
 
     def ensure_source(self, src: str, value: float, t: float):
         if src not in self.calibrations:
@@ -916,6 +1115,7 @@ class OnlineSourceCalibrator:
             self.live_calibration_samples[src] = 0
             self.live_calibration_span[src] = 0.0
             self.live_calibration_pairs[src] = 0
+        c = self.calibrations[src]
         baseline_outlier = min(max(float(c.outlier_rate), 0.0), 0.5)
         self._drift.setdefault(
             src,
@@ -942,7 +1142,13 @@ class OnlineSourceCalibrator:
         )
         return self.last_anchor
 
-    def _record_close_pairs(self, now: float, tau: float, updated_source: str):
+    def _record_close_pairs(
+        self,
+        now: float,
+        tau: float,
+        updated_source: str,
+        min_sample_interval: float = 0.0,
+    ):
         if updated_source not in self.cache:
             return False
         c0 = self.calibrations[updated_source]
@@ -972,7 +1178,19 @@ class OnlineSourceCalibrator:
             r = (z0 - c0.bias) - (zp - cp.bias)
             if not math.isfinite(r):
                 continue
-            self.pair_residuals.setdefault(key, deque()).append((float(now), float(r)))
+            dq = self.pair_residuals.setdefault(key, deque())
+            # Time-decimate dense live evidence. The filter still consumes
+            # every observation; only the expensive metrology evidence is
+            # thinned.
+            if (
+                dq
+                and min_sample_interval > 0.0
+                and float(now) - float(dq[-1][0]) < min_sample_interval
+            ):
+                continue
+            dq.append((float(now), float(r)))
+            while len(dq) > self._evidence_max_points_per_series:
+                dq.popleft()
             self.last_pair_sample[key] = stamp
             added = True
         return added
@@ -1245,85 +1463,45 @@ class OnlineSourceCalibrator:
             "pair_residual_points": sum(
                 len(dq) for dq in self.pair_residuals.values()
             ),
+            "evidence_max_points_per_series": int(
+                self._evidence_max_points_per_series
+            ),
+            "evidence_step_s": max(
+                float(window) / float(self._evidence_max_points_per_series),
+                1.0,
+            ),
         }
 
     def update_snapshot(
         self, now: float, tau: float, updated_source: str | None = None
     ):
-        """Accumulate evidence cheaply and run O(history) work only when due."""
-        if len(self.cache) < 2:
-            return False
-        if self._online_start_time is None:
-            self._online_start_time = float(now)
+        """Keep live source metrology fixed between long-history calibrations.
 
-        fresh = {}
-        for src, (t, z) in self.cache.items():
-            c = self.calibrations[src]
-            max_age = max(3.0 * c.median_dt, 0.20 * tau, 5.0)
-            if now - t <= max_age:
-                fresh[src] = z
-        if len(fresh) < 2:
-            return False
+        Bias and per-source observation sigma are metrology parameters. They are
+        learned from Recorder/startup history and must not be re-estimated from
+        the current process motion. Live samples update only the O(1) drift
+        diagnostics via :meth:`observe_innovation`; the state estimator still
+        consumes every observation.
 
-        corrected = [
-            z - self.calibrations[src].bias for src, z in fresh.items()
-        ]
-        ref = _median(corrected)
-        dynamic_window = max(
-            3.0 * tau,
-            10.0 * _median(
-                [self.calibrations[s].median_dt for s in fresh], 60.0
-            ),
-            3600.0,
-        )
-        window = self.calibration_window_s or dynamic_window
-        cutoff = now - window
-
-        # Cheap accumulation only; no median/MAD over the whole window.
-        for src, z in fresh.items():
-            dq = self.residuals.setdefault(src, deque())
-            dq.append((now, z - ref))
-            while dq and dq[0][0] < cutoff:
-                dq.popleft()
-
-        src_now = updated_source or self._last_updated_source
-        if src_now:
-            self._record_close_pairs(now, tau, src_now)
-
-        for dq in self.pair_residuals.values():
-            while dq and dq[0][0] < cutoff:
-                dq.popleft()
-
-        interval = self._refit_interval(window)
-        if self._last_refit_ts and now - self._last_refit_ts < interval:
-            return False
-
-        return self._full_refit(now, window)
+        This intentionally disables the former rolling pair-residual sigma
+        refit. The current ensemble variance is still recomputed online from
+        the fixed source variances plus age/prediction uncertainty.
+        """
+        return False
 
     def _full_refit(self, now: float, window: float):
         """Run the expensive rolling bias/noise calibration pass."""
         started = time.perf_counter()
         self._refit_runs += 1
         self._last_refit_ts = float(now)
-        point_count = (
-            sum(len(dq) for dq in self.residuals.values())
-            + sum(len(dq) for dq in self.pair_residuals.values())
-        )
+        point_count = sum(len(dq) for dq in self.pair_residuals.values())
         self._refit_last_points = int(point_count)
 
         try:
-            for src, dq in self.residuals.items():
-                if src not in self.calibrations or len(dq) < 8:
-                    continue
-                c = self.calibrations[src]
-                vals = [v for _, v in dq]
-                b = _median(vals)
-                alpha = min(
-                    0.05, max(c.median_dt / max(window, 1.0), 0.005)
-                )
-                c.bias = (1.0 - alpha) * c.bias + alpha * b
-
-            self.normalize_bias_gauge()
+            # Bias is deliberately NOT updated from live/short-window evidence.
+            # It is a long-horizon metrology parameter and is recalibrated from
+            # Recorder history by the sensor layer. Live evidence below is used
+            # only for observation-noise (sigma) maintenance.
 
             live_rows, live_counts, live_spans = self._pair_rows_live(
                 now, window
@@ -1347,6 +1525,10 @@ class OnlineSourceCalibrator:
             rows = self._combine_startup_and_live_rows(
                 live_rows, now=now, window=window
             )
+            # Cache the already-computed robust summary for subsequent cheap
+            # checkpoint saves.  No extra O(history) persistence pass.
+            self._compact_rows_cache = list(rows)
+            self._compact_rows_time = float(now)
             solved = _solve_source_variances(self.calibrations, rows)
 
             if solved:

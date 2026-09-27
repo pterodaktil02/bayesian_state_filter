@@ -46,6 +46,19 @@ class CoreFilter:
         else:
             self.process_noise.q_acc = value
 
+
+    @property
+    def level_q_process(self) -> float:
+        return float(getattr(self.process_noise, "level_q", 0.0))
+
+    @level_q_process.setter
+    def level_q_process(self, value: float) -> None:
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("level_q_process must be finite and >= 0")
+        if hasattr(self.process_noise, "level_q"):
+            self.process_noise.level_q = value
+
     @property
     def tau(self) -> float:
         return float(self.prior_timescale_s)
@@ -85,6 +98,7 @@ class CoreFilter:
             "t_last": self.t_last,
             "_last_pred_var": self._last_pred_var,
             "q_process": self.q_process,
+            "level_q_process": self.level_q_process,
             "prior_timescale_s": self.prior_timescale_s,
             "order": self.state_model.dim_x() - 1,
         }
@@ -104,6 +118,9 @@ class CoreFilter:
             q = data.get("q_process", data.get("q_jerk", data.get("q_acc")))
             if q is not None:
                 self.q_process = q
+            level_q = data.get("level_q_process")
+            if level_q is not None:
+                self.level_q_process = level_q
             T = data.get("prior_timescale_s", data.get("tau"))
             if T is not None:
                 self.tau = T

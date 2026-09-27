@@ -65,8 +65,11 @@ CHARACTERISTIC_REFIT_MIN_S = 300.0
 # v0.3 full [x,v,a,j] posterior diagnostics. Derivative values are exposed in
 # human-scale per-hour units while the internal state remains per-second.
 ATTR_RATE_PER_HOUR = "rate_per_hour"
+ATTR_RATE_STDDEV_PER_HOUR = "rate_stddev_per_hour"
 ATTR_CURVATURE_PER_HOUR2 = "curvature_per_hour2"
+ATTR_CURVATURE_STDDEV_PER_HOUR2 = "curvature_stddev_per_hour2"
 ATTR_JERK_PER_HOUR3 = "jerk_per_hour3"
+ATTR_JERK_STDDEV_PER_HOUR3 = "jerk_stddev_per_hour3"
 ATTR_RATE_WEIGHT = "rate_weight"
 ATTR_CURVATURE_WEIGHT = "curvature_weight"
 ATTR_JERK_WEIGHT = "jerk_weight"
