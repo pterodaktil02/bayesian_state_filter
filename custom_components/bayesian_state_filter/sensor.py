@@ -1463,105 +1463,188 @@ class BayesianEnsembleSensor(SensorEntity):
         ``compact`` is the public/default surface.  ``full`` restores the
         laboratory diagnostics from 2.1.0 for troubleshooting and research.
         """
-        var = max(float(self.filter.P[0, 0]), 0.0)
-        velocity = float(self.filter.x[1]) if len(self.filter.x) > 1 else 0.0
-        acceleration = float(self.filter.x[2]) if len(self.filter.x) > 2 else 0.0
-        jerk = float(self.filter.x[3]) if len(self.filter.x) > 3 else 0.0
+        # Take one atomic numerical snapshot for every state-derived public
+        # diagnostic.  The estimator can be updated independently of the
+        # slower attribute publication cadence, so mixing separate reads of x
+        # and P can otherwise expose an internally inconsistent diagnostic
+        # tuple (most visibly jerk / jerk_stddev / jerk_z).
+        x_diag = np.array(self.filter.x, dtype=float, copy=True)
+        P_diag = np.array(self.filter.P, dtype=float, copy=True)
+
+        var = max(float(P_diag[0, 0]), 0.0)
+        velocity = float(x_diag[1]) if len(x_diag) > 1 else 0.0
+        acceleration = float(x_diag[2]) if len(x_diag) > 2 else 0.0
+        jerk = float(x_diag[3]) if len(x_diag) > 3 else 0.0
         dt_weight = self._level_grid_step
         if self._last_update_diag is not None:
             dt_weight = max(float(self._last_update_diag.get("update_dt_s", dt_weight)), 1e-6)
         model = self.filter.state_model
         if hasattr(model, "effective_weights"):
-            eff_w = model.effective_weights(self.filter.x, self.filter.P, dt_weight)
-            conf_w = model.confidence_weights(self.filter.x, self.filter.P)
+            eff_w = model.effective_weights(x_diag, P_diag, dt_weight)
+            conf_w = model.confidence_weights(x_diag, P_diag)
         else:
             eff_w = [1.0] * len(self.filter.x)
             conf_w = eff_w
 
-        def _z(order):
-            if order >= len(self.filter.x):
+        def _sigma(order):
+            if order >= len(x_diag):
                 return 0.0
-            sigma = math.sqrt(max(float(self.filter.P[order, order]), NUMERIC_VARIANCE_FLOOR))
-            return abs(float(self.filter.x[order])) / sigma
+            return math.sqrt(max(float(P_diag[order, order]), NUMERIC_VARIANCE_FLOOR))
 
-        # Compact public surface: state uncertainty, robust update health,
-        # source calibration, and the independently estimated level-process
-        # characteristic time.
+        def _z(order):
+            sigma = _sigma(order)
+            if sigma <= 0.0 or order >= len(x_diag):
+                return 0.0
+            return abs(float(x_diag[order])) / sigma
+
+        # Compact public surface.  Group related diagnostics so the entity
+        # remains readable in Home Assistant.  The old flat attributes are
+        # retained for one compatibility cycle below.
         anchor_diag = self._source_cal.last_anchor if self._source_cal is not None else None
-        attrs = {
-            ATTR_STDDEV: round(math.sqrt(var), 10),
+
+        dynamics = {
+            "rate": {
+                "value_per_hour": round(velocity * 3600.0, 10),
+                "stddev_per_hour": round(_sigma(1) * 3600.0, 10),
+                "z": round(_z(1), 4),
+                "weight": round(float(eff_w[1]), 6) if len(eff_w) > 1 else 0.0,
+            },
+            "curvature": {
+                "value_per_hour2": round(acceleration * (3600.0 ** 2), 10),
+                "stddev_per_hour2": round(_sigma(2) * (3600.0 ** 2), 10),
+                "z": round(_z(2), 4),
+                "weight": round(float(eff_w[2]), 6) if len(eff_w) > 2 else 0.0,
+            },
+            "jerk": {
+                "value_per_hour3": round(jerk * (3600.0 ** 3), 10),
+                "stddev_per_hour3": round(_sigma(3) * (3600.0 ** 3), 10),
+                "z": round(_z(3), 4),
+                "weight": round(float(eff_w[3]), 6) if len(eff_w) > 3 else 0.0,
+            },
+        }
+
+        timescales = {
+            "gated": {
+                "timescale_s": round(float(self.filter.tau), 3),
+                "local_rmse": None,
+                "local_rmse_step1": None,
+                "local_rmse_step2": None,
+            },
+            "characteristic": {
+                "time_s": None,
+                "p10_s": None,
+                "p90_s": None,
+                "confidence": 0.0,
+                "status": "unavailable",
+                "identifiable": False,
+                "boundary_limited": False,
+            },
+        }
+        if self._gated_dynamics is not None:
+            timescales["gated"].update({
+                "local_rmse": round(float(self._gated_dynamics.validation_rmse), 10),
+                "local_rmse_step1": round(float(self._gated_dynamics.validation_rmse_step1), 10),
+                "local_rmse_step2": round(float(self._gated_dynamics.validation_rmse_step2), 10),
+            })
+
+        if self._characteristic is not None:
+            c = self._characteristic
+            timescales["characteristic"].update({
+                "time_s": self._round_optional(c.tau),
+                "p10_s": self._round_optional(c.p10),
+                "p90_s": self._round_optional(c.p90),
+                "confidence": round(c.confidence, 4),
+                "status": c.status,
+                "identifiable": bool(c.identifiable),
+                "boundary_limited": bool(c.boundary_limited),
+            })
+
+        calibration = {
             "bias_anchor_mode": self._bias_anchor,
             "bias_anchor_last_shift": (round(float(anchor_diag.shift), 10) if anchor_diag else 0.0),
+            "noise_variance_source": ("per_source_calibration" if self._calibrations else "model_default"),
+        }
+        if anchor_diag and anchor_diag.model_centers:
+            calibration["bias_anchor_models"] = {
+                model_name: {
+                    "center": round(float(center), 8),
+                    "absolute_accuracy": round(float(self._model_accuracy.get(model_name, 0.0)), 8),
+                    "effective_weight": round(float((anchor_diag.model_weights or {}).get(model_name, 0.0)), 8),
+                }
+                for model_name, center in anchor_diag.model_centers.items()
+            }
+
+        attrs = {
+            ATTR_STDDEV: round(math.sqrt(var), 10),
+            "model": {
+                "filter_mode": self._mode_name(),
+                "noise_model_mode": self._noise_mode_cfg,
+                "noise_model": self._noise_model_name,
+                "noise_model_params": self._noise_model_params(),
+            },
+            "calibration": calibration,
+            "dynamics": dynamics,
+            "timescales": timescales,
+            "startup": {
+                "mode": self._startup_mode,
+                "checkpoint_store_key": self._store_key,
+            },
+            ATTR_SOURCE_HEALTH: self._source_health(),
+        }
+
+        # Show one internally consistent observation/update record. These
+        # values all refer to the same source and the same Bayesian update.
+        if last_out is not None:
+            self._remember_update_diag(last_out)
+        if self._last_update_diag is not None:
+            d = self._last_update_diag
+            attrs["last_update"] = {
+                "source": self._last_source,
+                "measurement_sigma": round(d["measurement_sigma"], 10),
+                "measurement_variance": round(d["measurement_variance"], 10),
+                "innovation": round(d["innovation"], 10),
+                "z_score": round(d["z_score"], 4),
+                "robust_weight": round(d["robust_weight"], 6),
+                "update_dt_s": round(d["update_dt_s"], 3),
+            }
+
+        # Compatibility layer for 0.4.1-era templates/automations.  Keep these
+        # flat aliases for one release cycle; new consumers should use the
+        # grouped dictionaries above.
+        attrs.update({
+            "bias_anchor_mode": calibration["bias_anchor_mode"],
+            "bias_anchor_last_shift": calibration["bias_anchor_last_shift"],
             "startup_mode": self._startup_mode,
             "checkpoint_store_key": self._store_key,
             ATTR_FILTER_MODE: self._mode_name(),
-            # ``noise_model_mode`` is the user's selection policy (auto /
-            # gaussian / poisson); ``noise_model`` is the family actually in
-            # use right now.  Auto is deliberately Gaussian-only for now, but
-            # this split lets a future detector select Poisson without changing
-            # YAML or the public attribute schema.
             ATTR_NOISE_MODEL_MODE: self._noise_mode_cfg,
             ATTR_NOISE_MODEL: self._noise_model_name,
             ATTR_NOISE_MODEL_PARAMS: self._noise_model_params(),
-            ATTR_NOISE_VARIANCE_SOURCE: ("per_source_calibration" if self._calibrations else "model_default"),
-            ATTR_SOURCE_HEALTH: self._source_health(),
-            # Full state is always [x,v,a,j]. Internal derivative units are per
-            # second; publish human-scale per-hour diagnostics.
-            ATTR_RATE_PER_HOUR: round(velocity * 3600.0, 10),
-            ATTR_RATE_STDDEV_PER_HOUR: round(
-                math.sqrt(max(float(self.filter.P[1, 1]), 0.0)) * 3600.0, 10
-            ),
-            ATTR_CURVATURE_PER_HOUR2: round(acceleration * (3600.0 ** 2), 10),
-            ATTR_CURVATURE_STDDEV_PER_HOUR2: round(
-                math.sqrt(max(float(self.filter.P[2, 2]), 0.0)) * (3600.0 ** 2), 10
-            ),
-            ATTR_JERK_PER_HOUR3: round(jerk * (3600.0 ** 3), 10),
-            ATTR_JERK_STDDEV_PER_HOUR3: round(
-                math.sqrt(max(float(self.filter.P[3, 3]), 0.0)) * (3600.0 ** 3), 10
-            ),
-            ATTR_RATE_WEIGHT: round(float(eff_w[1]), 6) if len(eff_w) > 1 else 0.0,
-            ATTR_CURVATURE_WEIGHT: round(float(eff_w[2]), 6) if len(eff_w) > 2 else 0.0,
-            ATTR_JERK_WEIGHT: round(float(eff_w[3]), 6) if len(eff_w) > 3 else 0.0,
-            ATTR_RATE_Z: round(_z(1), 4),
-            ATTR_CURVATURE_Z: round(_z(2), 4),
-            ATTR_JERK_Z: round(_z(3), 4),
-            ATTR_GATED_TIMESCALE: round(float(self.filter.tau), 3),
-        }
-        if self._gated_dynamics is not None:
-            attrs.update({
-                ATTR_GATED_LOCAL_RMSE: round(float(self._gated_dynamics.validation_rmse), 10),
-                ATTR_GATED_LOCAL_RMSE_STEP1: round(float(self._gated_dynamics.validation_rmse_step1), 10),
-                ATTR_GATED_LOCAL_RMSE_STEP2: round(float(self._gated_dynamics.validation_rmse_step2), 10),
-            })
-
-        # Level-process characteristic time: variogram estimate, entirely
-        # separate from the damped-velocity tau used internally by CoreFilter.
-        if self._characteristic is not None:
-            c = self._characteristic
-            attrs.update({
-                ATTR_CHARACTERISTIC_TIME: self._round_optional(c.tau),
-                ATTR_CHARACTERISTIC_TIME_P10: self._round_optional(c.p10),
-                ATTR_CHARACTERISTIC_TIME_P90: self._round_optional(c.p90),
-                ATTR_CHARACTERISTIC_TIME_CONFIDENCE: round(c.confidence, 4),
-                ATTR_CHARACTERISTIC_TIME_STATUS: c.status,
-                ATTR_CHARACTERISTIC_TIME_IDENTIFIABLE: bool(c.identifiable),
-                ATTR_DYNAMICS_BOUNDARY_LIMITED: bool(c.boundary_limited),
-            })
-        else:
-            attrs.update({
-                ATTR_CHARACTERISTIC_TIME: None,
-                ATTR_CHARACTERISTIC_TIME_CONFIDENCE: 0.0,
-                ATTR_CHARACTERISTIC_TIME_STATUS: "unavailable",
-                ATTR_CHARACTERISTIC_TIME_IDENTIFIABLE: False,
-                ATTR_DYNAMICS_BOUNDARY_LIMITED: False,
-            })
-
-        # Show one internally consistent observation/update record.  These
-        # values all refer to the same source and the same Bayesian update.
-        # They remain visible if _build_attrs() is later called by a background
-        # characteristic-time refit.
-        if last_out is not None:
-            self._remember_update_diag(last_out)
+            ATTR_NOISE_VARIANCE_SOURCE: calibration["noise_variance_source"],
+            ATTR_RATE_PER_HOUR: dynamics["rate"]["value_per_hour"],
+            ATTR_RATE_STDDEV_PER_HOUR: dynamics["rate"]["stddev_per_hour"],
+            ATTR_CURVATURE_PER_HOUR2: dynamics["curvature"]["value_per_hour2"],
+            ATTR_CURVATURE_STDDEV_PER_HOUR2: dynamics["curvature"]["stddev_per_hour2"],
+            ATTR_JERK_PER_HOUR3: dynamics["jerk"]["value_per_hour3"],
+            ATTR_JERK_STDDEV_PER_HOUR3: dynamics["jerk"]["stddev_per_hour3"],
+            ATTR_RATE_WEIGHT: dynamics["rate"]["weight"],
+            ATTR_CURVATURE_WEIGHT: dynamics["curvature"]["weight"],
+            ATTR_JERK_WEIGHT: dynamics["jerk"]["weight"],
+            ATTR_RATE_Z: dynamics["rate"]["z"],
+            ATTR_CURVATURE_Z: dynamics["curvature"]["z"],
+            ATTR_JERK_Z: dynamics["jerk"]["z"],
+            ATTR_GATED_TIMESCALE: timescales["gated"]["timescale_s"],
+            ATTR_GATED_LOCAL_RMSE: timescales["gated"]["local_rmse"],
+            ATTR_GATED_LOCAL_RMSE_STEP1: timescales["gated"]["local_rmse_step1"],
+            ATTR_GATED_LOCAL_RMSE_STEP2: timescales["gated"]["local_rmse_step2"],
+            ATTR_CHARACTERISTIC_TIME: timescales["characteristic"]["time_s"],
+            ATTR_CHARACTERISTIC_TIME_P10: timescales["characteristic"]["p10_s"],
+            ATTR_CHARACTERISTIC_TIME_P90: timescales["characteristic"]["p90_s"],
+            ATTR_CHARACTERISTIC_TIME_CONFIDENCE: timescales["characteristic"]["confidence"],
+            ATTR_CHARACTERISTIC_TIME_STATUS: timescales["characteristic"]["status"],
+            ATTR_CHARACTERISTIC_TIME_IDENTIFIABLE: timescales["characteristic"]["identifiable"],
+            ATTR_DYNAMICS_BOUNDARY_LIMITED: timescales["characteristic"]["boundary_limited"],
+        })
         if self._last_update_diag is not None:
             d = self._last_update_diag
             if self._last_source is not None:
@@ -1574,6 +1657,8 @@ class BayesianEnsembleSensor(SensorEntity):
                 ATTR_ROBUST_WEIGHT: round(d["robust_weight"], 6),
                 ATTR_UPDATE_DT: round(d["update_dt_s"], 3),
             })
+        if "bias_anchor_models" in calibration:
+            attrs["bias_anchor_models"] = calibration["bias_anchor_models"]
 
         if self._diagnostics_full:
             # Exact 2.1-era laboratory diagnostics.  Kept behind an explicit
@@ -1611,15 +1696,6 @@ class BayesianEnsembleSensor(SensorEntity):
                     ),
                 })
 
-        if anchor_diag and anchor_diag.model_centers:
-            attrs["bias_anchor_models"] = {
-                model: {
-                    "center": round(float(center), 8),
-                    "absolute_accuracy": round(float(self._model_accuracy.get(model, 0.0)), 8),
-                    "effective_weight": round(float((anchor_diag.model_weights or {}).get(model, 0.0)), 8),
-                }
-                for model, center in anchor_diag.model_centers.items()
-            }
         self._attrs = attrs
 
     def _mode_name(self):

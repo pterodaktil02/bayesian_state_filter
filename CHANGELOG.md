@@ -49,6 +49,9 @@
 - Fixed `numpy` import in the new robust ensemble fusion path.
 - Fixed startup/live calibration inconsistencies that allowed recent process motion to overwrite long-history source statistics.
 - Fixed runtime behavior where dynamic derivative terms could create ringing while the level process itself remained too rigid.
+- Fixed derivative observability deadlock: confidence gating now controls mean prediction only, while covariance uses the full kinematic transition so `v/a/j` can become observable from level measurements.
+- Unified the numerical variance floor used by derivative z-scores and exponential gating, preventing collapsed covariance from falsely opening higher-order derivative gates.
+- Made derivative diagnostics use one atomic `x/P` snapshot and grouped public diagnostics into `model`, `calibration`, `dynamics`, `timescales`, `startup`, and `last_update` blocks while retaining flat compatibility aliases.
 
 ## 0.4.0 - 2026-09-24
 

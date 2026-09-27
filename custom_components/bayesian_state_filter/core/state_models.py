@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import numpy as np
 
+from ..const import NUMERIC_VARIANCE_FLOOR
+
 
 class PolynomialStateModel:
     """Local polynomial state [x, dx/dt, ..., d^order x/dt^order]."""
@@ -77,7 +79,7 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
 
     @staticmethod
     def significance(value: float, variance: float) -> float:
-        sigma = math.sqrt(max(float(variance), np.finfo(float).tiny))
+        sigma = math.sqrt(max(float(variance), NUMERIC_VARIANCE_FLOOR))
         return abs(float(value)) / sigma
 
     def confidence_weight(self, value: float, variance: float, derivative_order: int = 1) -> float:
@@ -150,11 +152,22 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         return Fw, weights
 
     def predict(self, x, P, dt, Q):
-        Fw, _weights = self.weighted_transition(x, P, dt)
+        # Confidence gating controls only how strongly currently supported
+        # derivatives bend the *mean* trajectory.  Covariance must still use
+        # the full kinematic transition so level observations can create and
+        # update x-v-a-j cross-covariances even when derivative means start at
+        # zero and their mean gates are closed.  Otherwise w=0 becomes an
+        # absorbing x-only state from which the hidden derivatives can never
+        # become observable.
+        F = self.transition(dt)
+        Fw = F.copy()
+        weights = self.effective_weights(x, P, dt)
+        for j in range(1, self.dim_x()):
+            for i in range(j):
+                Fw[i, j] *= weights[j]
+
         x_pred = Fw @ x
-        # Mean and covariance use the same local transition to avoid large
-        # hidden-state kicks through ungated cross-covariances.
-        P_pred = Fw @ P @ Fw.T + Q
+        P_pred = F @ P @ F.T + Q
         return x_pred, P_pred
 
 
