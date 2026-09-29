@@ -125,12 +125,105 @@ def _pearson(xs, ys):
     return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / math.sqrt(sx * sy)
 
 
-def _poisson_evidence(values, quant_step):
-    """Assess whether local observation variance scales with signal level.
+def _sample_skewness(values):
+    """Population-style skewness used only as a long-history diagnostic."""
+    n = len(values)
+    if n < 3:
+        return 0.0
+    mean = statistics.mean(values)
+    var = sum((x - mean) ** 2 for x in values) / n
+    if var <= 0:
+        return 0.0
+    sigma = math.sqrt(var)
+    return sum(((x - mean) / sigma) ** 3 for x in values) / n
 
-    Quantization is *not* evidence for or against Poisson noise.  It is used
-    only to decide whether the available level span is large enough to resolve
-    a variance-vs-level relationship above the value lattice.
+
+def _stationary_poisson_evidence(values, quant_step):
+    """Look for scaled-Poisson moment structure when level span is small.
+
+    A stationary record cannot prove Var(X) proportional to E[X] from level
+    dependence alone. However, a scaled Poisson variable Y=k*N obeys:
+
+        Var(Y) = k * E[Y]
+        skew(Y) = sqrt(k / E[Y]) = sigma(Y) / E[Y]
+
+    The second relation gives information that a stationary Gaussian source
+    does not have. The fallback is deliberately conservative: it requires a
+    long positive history, statistically significant positive skewness, and
+    close agreement between observed and Poisson-predicted skewness.
+
+    Quantization is not proof of Poisson noise. If present, it contributes only
+    a small confidence bonus after the moment test has passed.
+    """
+    n = len(values)
+    if n < 512:
+        return {"status": "insufficient_stationary_history", "confidence": 0.0}
+    if min(values) < 0:
+        return {"status": "negative_values", "confidence": 0.75}
+
+    mean = statistics.mean(values)
+    if mean <= 0:
+        return {"status": "nonpositive_level", "confidence": 0.75}
+
+    var = statistics.pvariance(values)
+    if not math.isfinite(var) or var <= 0:
+        return {"status": "insufficient_variance", "confidence": 0.0}
+
+    sigma = math.sqrt(var)
+    scale = var / mean
+    predicted_skew = sigma / mean
+    observed_skew = _sample_skewness(values)
+
+    # For Gaussian data, the standard error of sample skewness is roughly
+    # sqrt(6/n). Requiring >2 sigma positive skew makes this fallback hard to
+    # trigger on ordinary stationary Gaussian sensors.
+    skew_se = math.sqrt(6.0 / n)
+    skew_z = observed_skew / max(skew_se, 1e-12)
+
+    if observed_skew <= 0 or skew_z < 2.0:
+        return {
+            "status": "stationary_skew_not_count_like",
+            "confidence": min(0.55, max(0.20, 0.20 + 0.10 * max(skew_z, 0.0))),
+            "scale": float(scale),
+            "observed_skew": float(observed_skew),
+            "predicted_skew": float(predicted_skew),
+            "skew_z": float(skew_z),
+        }
+
+    mismatch = abs(observed_skew - predicted_skew) / max(predicted_skew, 1e-12)
+    if mismatch > 0.45:
+        return {
+            "status": "stationary_moment_mismatch",
+            "confidence": 0.45,
+            "scale": float(scale),
+            "observed_skew": float(observed_skew),
+            "predicted_skew": float(predicted_skew),
+            "skew_z": float(skew_z),
+            "relative_skew_mismatch": float(mismatch),
+        }
+
+    match = max(0.0, 1.0 - mismatch / 0.45)
+    significance = min(1.0, max(0.0, (skew_z - 2.0) / 2.0))
+    quant_bonus = 0.05 if quant_step is not None else 0.0
+    confidence = min(0.85, 0.58 + 0.17 * match + 0.05 * significance + quant_bonus)
+
+    return {
+        "status": "stationary_poisson",
+        "confidence": float(confidence),
+        "scale": float(scale),
+        "observed_skew": float(observed_skew),
+        "predicted_skew": float(predicted_skew),
+        "skew_z": float(skew_z),
+        "relative_skew_mismatch": float(mismatch),
+    }
+
+
+def _poisson_evidence(values, quant_step):
+    """Assess whether observation variance follows a Poisson-like law.
+
+    Primary route: detect variance growth with signal level.
+    Fallback route: for long but nearly stationary positive series, test the
+    scaled-Poisson moment relation between variance and skewness.
     """
     if len(values) < 256:
         return {"status": "insufficient_history", "confidence": 0.0}
@@ -147,11 +240,17 @@ def _poisson_evidence(values, quant_step):
     if quant_step is not None:
         span_required = max(span_required, 8.0 * quant_step)
     if (p90 - p10) < span_required:
+        stationary = _stationary_poisson_evidence(values, quant_step)
+        if stationary.get("status") == "stationary_poisson":
+            stationary["level_span"] = float(p90 - p10)
+            stationary["required_span"] = float(span_required)
+            return stationary
         return {
             "status": "insufficient_level_span",
             "confidence": 0.20,
             "level_span": float(p90 - p10),
             "required_span": float(span_required),
+            "stationary_test": stationary,
         }
 
     pairs = []
@@ -247,16 +346,19 @@ def detect_noise_model(histories: dict[str, list[tuple[float, float]]]) -> Noise
 
     qstep, qconf = _consensus_quantization(per_source)
 
-    poisson = [row[4] for row in per_source if row[4].get("status") == "poisson"]
+    poisson_statuses = {"poisson", "stationary_poisson"}
+    poisson = [row[4] for row in per_source if row[4].get("status") in poisson_statuses]
     needed = max(1, math.ceil(len(per_source) * 0.6))
     if len(poisson) >= needed:
+        stationary_only = all(p.get("status") == "stationary_poisson" for p in poisson)
         return NoiseDetectionResult(
             family="poisson",
             confidence=float(statistics.median(p["confidence"] for p in poisson)),
             poisson_scale=float(statistics.median(p["scale"] for p in poisson)),
             quantization_step=qstep,
             quantization_confidence=qconf,
-            reason="variance_scales_with_level",
+            reason=("stationary_scaled_poisson" if stationary_only
+                    else "variance_scales_with_level"),
         )
 
     statuses = [row[4].get("status") for row in per_source]

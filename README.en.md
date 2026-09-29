@@ -31,7 +31,7 @@ The state is always:
 
 where `x` is level, `v` is rate, `a` is acceleration and `j` is jerk.
 
-The model uses an integrated Wiener process. The same confidence-gated transition matrix is applied to both state mean and covariance, so weakly observed hidden derivatives cannot destabilize prediction through ungated cross-covariances.
+The model uses an integrated Wiener process. Confidence gating is applied to the mean prediction, while covariance is propagated through the full kinematic transition. This prevents weakly supported derivatives from driving the mean while preserving their observability through cross-covariances.
 
 ### Derivative confidence
 
@@ -146,7 +146,16 @@ quantization_sigma
 quantization_confidence
 ```
 
-A quantized output is not automatically Poisson. Count-derived and scaled-count signals can use the Poisson-like model whose variance scales with level.
+Quantization by itself is not evidence for Poisson noise. A discretized pressure sensor can therefore remain `gaussian` while still reporting `quantization_step: 1`.
+
+Automatic scaled-Poisson detection uses two evidence paths:
+
+1. When history spans a sufficiently broad range of levels, the detector tests whether local variance grows with level: `Var(X) ~ k * E[X]`. Stable positive variance scaling yields `reason: variance_scales_with_level`.
+2. When the signal is nearly stationary and level span is insufficient, the detector uses a scaled-Poisson moment test. For `X = kN` with Poisson `N`, `skew(X) = sigma / mean`. The fallback requires a long positive history, statistically significant positive skewness, and agreement between observed `skew` and `sigma/mean`. A successful test yields `reason: stationary_scaled_poisson`.
+
+If broad level coverage is available but variance does not grow with level, the detector selects Gaussian with `reason: variance_not_level_dependent`. Negative values are strong evidence against a count-like model and yield `reason: not_count_like`.
+
+For count-derived and scaled-count signals, the Poisson-like runtime model uses variance proportional to the current level. The inferred `variance_scale` is exposed in noise-model diagnostics.
 
 ## Fast restart and checkpoints
 

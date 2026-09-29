@@ -182,7 +182,7 @@ class BayesianEnsembleSensor(SensorEntity):
         self._gaussian_noise = GaussianNoise(sigma=0.1)
         self._poisson_noise = PoissonLikeNoise(k=0.1)
         self._noise_model_name = "gaussian"
-        self._noise_detection_version = 2
+        self._noise_detection_version = 3
         self._noise_detection = NoiseDetectionResult(reason="not_yet_detected")
 
         default_tau = self._tau_min_s or 3600.0
@@ -1233,6 +1233,7 @@ class BayesianEnsembleSensor(SensorEntity):
             "bias_anchor": self._bias_anchor,
             "bias_huber_delta": float(self._bias_huber_delta),
             "noise_model": self._noise_mode_cfg,
+            "noise_detection_version": int(self._noise_detection_version),
             "bias_history_version": 1,
         }
         # Single-source observation-noise calibration has its own schema.

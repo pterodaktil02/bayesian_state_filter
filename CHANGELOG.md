@@ -36,12 +36,16 @@
 - Added automatic noise-family diagnostics with Gaussian vs scaled-Poisson classification.
 - Quantization is represented independently from the stochastic family through `quantization_step`, `quantization_sigma` and `quantization_confidence`.
 - A quantized signal is no longer implicitly classified as Gaussian or Poisson solely because it is quantized.
+- Added a stationary scaled-Poisson fallback for low-span signals using the moment identity `skew(X) ~= sigma / mean`, with positive-skew significance and moment-mismatch guards.
+- Preserved the broad-span variance-vs-level test as the primary classifier; stationary moment evidence is used only when the level range is too small for that test.
+- Added `stationary_scaled_poisson` as an explicit diagnostic reason and retained quantization as an independent observation property.
 
 ### Performance and persistence
 - Heavy source calibration remains outside the per-sample hot path and is executed through the Home Assistant executor.
 - Warmup history is bounded/cleared after training, and checkpoint persistence reuses cached heavy summaries instead of recomputing them on every save.
 - Reduced public diagnostics by removing CPU-profiler attributes while keeping process and source-quality information.
 - Checkpoint schema was advanced for the new process-noise semantics; the first start after upgrading to 0.4.1 may require one full Recorder bootstrap.
+- Noise-detector schema is now part of the checkpoint configuration fingerprint, so a detector upgrade triggers one clean Recorder bootstrap instead of reusing a stale family classification.
 
 ### Fixes
 - Fixed duplicated residual evidence from appending all fresh sources on every source event.
