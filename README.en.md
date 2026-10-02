@@ -1,6 +1,6 @@
 # Bayesian State Filter for Home Assistant
 
-Version: **0.4.1**
+Version: **0.5.0-dev.10**
 
 [Русское описание](README.md)
 
@@ -33,31 +33,44 @@ where `x` is level, `v` is rate, `a` is acceleration and `j` is jerk.
 
 The model uses an integrated Wiener process. Confidence gating is applied to the mean prediction, while covariance is propagated through the full kinematic transition. This prevents weakly supported derivatives from driving the mean while preserving their observability through cross-covariances.
 
-### Derivative confidence
+### Derivative plausibility
 
-For every derivative, the filter computes the posterior z-score:
+The derivatives `v/a/j` are part of the state vector itself and directly affect level prediction. Their operational weight is therefore based on how typical their magnitude is for the process, not on how strongly they differ from zero.
 
-```text
-z_d = |d| / sigma_d
-```
-
-and base confidence:
+The filter learns local-polynomial derivatives from long Recorder history. For every derivative order it estimates a robust historical scale:
 
 ```text
-c(z) = erf(|z| / sqrt(2))
+sigma_hist = 1.4826 * MAD(d)
 ```
 
-Since 0.4.1, higher-order derivatives are suppressed more strongly when their evidence is weak:
+Training windows that cross confirmed level regime changes are excluded. Historical segmentation uses the same semantics as live recovery: roughly 6 sigma deviation, three same-direction confirmations and a compact new plateau.
+
+The production plausibility gate is centred at zero:
 
 ```text
-g_k(c) = exp(-k * (1-c) / c)
+z = |d| / sigma_hist
 
-w_v = g_1(c_v)
-w_a = w_v * g_2(c_a)
-w_j = w_a * g_3(c_j)
+w = exp(-z^2 / 2),  z < 5
+w = 0,              z >= 5
 ```
 
-Weak acceleration and jerk therefore collapse rapidly toward zero influence, while strongly supported derivatives pass smoothly without hard thresholds or mode switches.
+A quiet process with derivative near zero therefore receives maximum weight, while abnormally large derivatives are suppressed.
+
+Higher orders inherit all lower-order penalties:
+
+```text
+W_v = w_v
+W_a = w_v * w_a
+W_j = w_v * w_a * w_j
+```
+
+As dynamics become implausible, the effective model degrades monotonically:
+
+```text
+x-v-a-j -> x-v-a -> x-v -> x
+```
+
+Posterior derivative z-scores and covariance remain available in debug diagnostics, but they no longer act as permission for unbounded extrapolation.
 
 ## Robust multi-source fusion
 
@@ -161,20 +174,23 @@ For count-derived and scaled-count signals, the Poisson-like runtime model uses 
 
 The integration writes a checkpoint to Home Assistant Store every **30 minutes**.
 
-The checkpoint contains `[x, v, a, j]`, covariance, process-noise parameters, source calibration, diagnostics and Recorder watermarks.
+The checkpoint contains `[x, v, a, j]`, covariance, process-noise parameters, source calibration and Recorder watermarks.
 
-After restart:
+After restart the filter catches up internally before exposing its first state:
 
 ```text
-load checkpoint
--> read Recorder tail after the saved watermark
--> replay it through the normal filter path
--> switch to live mode
+load checkpoint / perform full bootstrap
+-> silently replay Recorder tail
+-> silently apply the freshest current source states
+-> synchronize the latent state to now
+-> only then publish the entity
 ```
 
-A full bootstrap is required only when the checkpoint is missing or incompatible. Version 0.4.1 uses a new checkpoint schema because process-noise semantics changed.
+A data gap caused by restart should therefore appear as increased uncertainty, not as an artificial level step.
 
-Heavy Recorder reads and calibration work stay outside the per-sample hot path; CPU-heavy work is dispatched through the Home Assistant executor.
+A publication fallback is also available. If the Bayesian level diverges strongly from the direct raw/fused observation while there is evidence of broken dynamics or a developing regime change, the entity temporarily publishes the direct observation. The latent Bayesian filter continues updating in the background and resumes publication after stable reconvergence.
+
+A full bootstrap is required only when the checkpoint is missing or incompatible. Heavy Recorder reads and calibration work stay outside the per-sample hot path; CPU-heavy work is dispatched through the Home Assistant executor.
 
 ## Installation
 
@@ -234,7 +250,7 @@ sensor:
       save_every_s: 1800
       student_nu: 4
       characteristic_refit_s: 21600
-      diagnostics: compact
+      diagnostics: normal
 ```
 
 Main options:
@@ -248,7 +264,7 @@ Main options:
 | `warmup_refit_s` | `21600` | Minimum retry interval for dynamics training |
 | `bias_anchor` | `median` | `median`, `mean` or `passport` |
 | `noise_model` | `auto` | `auto`, `gaussian` or `poisson` |
-| `diagnostics` | `compact` | `compact`, `full`, `debug`, `verbose` |
+| `diagnostics` | `normal` | `minimal`, `normal` or `debug`; legacy `compact/full/verbose` are accepted as aliases |
 
 ### `passport` anchoring example
 
@@ -280,52 +296,66 @@ Multiple sensors of the same model do not create multiple independent absolute-r
 
 ## Main attributes
 
-```text
-stddev
-rate_per_hour
-curvature_per_hour2
-jerk_per_hour3
+The default `normal` diagnostics expose a compact operational view:
 
-rate_weight
-curvature_weight
-jerk_weight
+```yaml
+stddev: ...
 
-rate_z
-curvature_z
-jerk_z
+filter:
+  mode: tracking
+  noise_model: gaussian
+  noise_confidence: ...
 
-gated_timescale_s
-gated_local_rmse
-gated_local_rmse_step1
-gated_local_rmse_step2
+dynamics:
+  rate:
+    value_per_hour: ...
+    weight: ...
+  curvature:
+    value_per_hour2: ...
+    weight: ...
+  jerk:
+    value_per_hour3: ...
+    weight: ...
+  plausibility:
+    rate_sigma_per_hour: ...
+    curvature_sigma_per_hour2: ...
+    jerk_sigma_per_hour3: ...
+    rate_mean_over_sigma: ...
+    curvature_mean_over_sigma: ...
+    jerk_mean_over_sigma: ...
 
-characteristic_time_s
-characteristic_time_confidence
-characteristic_time_status
-characteristic_time_identifiable
+regime:
+  candidate: false
+  last_jump: ...
+
+fallback:
+  active: false
+
+sources:
+  configured: ...
+  active: ...
+  unhealthy: ...
+
+last_update:
+  source: ...
+  innovation_z: ...
+  clipped: false
+  dt_s: ...
 ```
 
-Per-source diagnostics under `source_health` include:
+`*_mean_over_sigma` reports the mean of the learned derivative distribution relative to its robust scale. A small non-zero value is normal for quantized and irregularly sampled processes.
 
-```text
-model
-bias
-sigma
-median_dt_s
-outlier_rate
-last_z_score
-robust_weight
-```
-
-Rate, curvature and jerk are exposed in per-hour units for readability; the internal model uses seconds.
+`minimal` keeps only the most important operational state. `debug` additionally exposes the full laboratory diagnostics: posterior derivative uncertainty and z-scores, calibration, source health, noise-model internals, timescales, startup catch-up, regime-change and fallback details.
 
 ## Practical notes
 
 - `bias` and `sigma` are slow source parameters; current physical motion should not relearn them every second.
 - Under `median`/`mean` anchoring, a common systematic offset shared by all sources is not identifiable. `passport` adds a prior, not a physical reference standard.
 - A source is not penalized merely for reporting slowly. Age increases uncertainty about its current value.
-- Large derivative values are not meaningful on their own; inspect `*_z` and `*_weight` as well.
-- When dynamics are not identifiable above noise, derivative weights should collapse toward zero and the filter naturally becomes a robust level estimator.
+- A derivative near zero is useful evidence of a quiet process and receives maximum plausibility weight.
+- Abnormally large derivatives are suppressed relative to their historical robust-MAD scale; at 5 sigma the local weight is zero.
+- Confirmed level regime changes are not learned as huge rate/acceleration/jerk events: training windows that cross them are excluded.
+- As dynamics become implausible, the model degrades hierarchically from `x-v-a-j` toward `x`.
 - `characteristic_time_s: null` with `insufficient_signal` is a valid result: the filter should not invent a process timescale that is not observable.
 
 ## Layout
