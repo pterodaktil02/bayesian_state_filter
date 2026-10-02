@@ -48,7 +48,7 @@ class IntegratedWienerProcessNoise:
                     Q[i, j] = qv * (dt ** power) / denom
         # Orthogonal level random walk.  Unlike snap-driven Q[0,0] ~ dt^7,
         # this contributes at every sample and keeps level uncertainty honest
-        # even while v/a/j confidence gates are near zero.
+        # even while v/a/j plausibility gates are near zero.
         if self.level_q > 0.0:
             Q[0, 0] += self.level_q * dt
         return Q

@@ -48,6 +48,8 @@ from .const import (
     NUMERIC_VARIANCE_FLOOR, STUDENT_T_MIN_WEIGHT,
     FRESHNESS_MEDIAN_DT_MULTIPLIER, FRESHNESS_TAU_FRACTION,
     FRESHNESS_MIN_S, CHARACTERISTIC_REFIT_MIN_S,
+    REGIME_CHANGE_Z_THRESHOLD, REGIME_CHANGE_CONFIRMATIONS,
+    REGIME_CHANGE_COMPACT_SIGMA,
 )
 from .core.filter import CoreFilter
 from .core.noise_models import GaussianNoise, PoissonLikeNoise
@@ -74,7 +76,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class BayesianEnsembleSensor(SensorEntity):
-    """Bayesian State Filter 0.4.1.
+    """Bayesian State Filter 0.5.0-dev.10.
 
     Backward-compatible YAML platform. Multi-source observations are fused
     from the latest per-source estimates at a common time. Older source
@@ -168,11 +170,27 @@ class BayesianEnsembleSensor(SensorEntity):
         self._warmup_max_points_per_source = max(int(bayes_cfg.get("warmup_max_points_per_source", 5000)), 200)
         self._forget_time_s = self._optional_float(bayes_cfg.get("forget_time_s"))
         self._student_nu = max(float(bayes_cfg.get("student_nu", 4.0)), 1.01)
-        # Public diagnostics are intentionally compact by default.  This is a
-        # presentation-only switch: it does not change filtering, training,
-        # persistence, or any estimator hyperparameters.
-        diagnostics = str(bayes_cfg.get("diagnostics", "compact")).strip().lower()
-        self._diagnostics_full = diagnostics in {"full", "debug", "verbose"}
+        # Hard winsorisation caps the *state correction* from one pathological
+        # observation while preserving the raw innovation for diagnostics and
+        # regime-change detection.  Three sigma is intentionally conservative.
+        self._innovation_clip_sigma = REGIME_CHANGE_COMPACT_SIGMA
+        # Public diagnostics are intentionally small. This switch only changes
+        # presentation; it never changes filtering, training, or persistence.
+        # Accepted aliases keep old configs working for one transition cycle.
+        diagnostics = str(bayes_cfg.get("diagnostics", "normal")).strip().lower()
+        aliases = {
+            "compact": "normal",
+            "full": "debug",
+            "verbose": "debug",
+        }
+        self._diagnostics_mode = aliases.get(diagnostics, diagnostics)
+        if self._diagnostics_mode not in {"minimal", "normal", "debug"}:
+            _LOGGER.warning(
+                "Bayesian State Filter: unknown diagnostics=%r; using normal",
+                diagnostics,
+            )
+            self._diagnostics_mode = "normal"
+        self._diagnostics_full = self._diagnostics_mode == "debug"
 
         self._attr_native_unit_of_measurement = None
         self._attr_device_class = None
@@ -182,14 +200,20 @@ class BayesianEnsembleSensor(SensorEntity):
         self._gaussian_noise = GaussianNoise(sigma=0.1)
         self._poisson_noise = PoissonLikeNoise(k=0.1)
         self._noise_model_name = "gaussian"
-        self._noise_detection_version = 3
+        self._runtime_noise_mode = "gaussian"
+        self._runtime_level_fraction = 0.0
+        self._runtime_variance_source = "constant"
+        self._noise_detection_version = 6
         self._noise_detection = NoiseDetectionResult(reason="not_yet_detected")
 
         default_tau = self._tau_min_s or 3600.0
         self.filter = CoreFilter(
             state_model=AdaptivePolynomialStateModel(3),
             noise_model=self._gaussian_noise,
-            updater=StudentTUpdater(nu=self._student_nu, min_weight=0.05),
+            updater=StudentTUpdater(
+                nu=self._student_nu, min_weight=0.05,
+                clip_sigma=self._innovation_clip_sigma,
+            ),
             process_noise=IntegratedWienerProcessNoise(order=3, q=0.0, level_q=0.0),
             prior_timescale_s=default_tau,
         )
@@ -197,7 +221,7 @@ class BayesianEnsembleSensor(SensorEntity):
         self._calibrations: dict[str, SourceCalibration] = {}
         self._source_cal: OnlineSourceCalibrator | None = None
         # Full [x,v,a,j] dynamics identified from history.  The state order is
-        # fixed; posterior confidence gates only derivative coupling.
+        # fixed; history-trained plausibility gates only derivative coupling.
         self._gated_dynamics: GatedDynamicsEstimate | None = None
         self._dynamics_bank = None  # legacy field retained only for migration-safe code paths
         self._dynamics = None       # legacy field retained only for old diagnostics
@@ -267,13 +291,59 @@ class BayesianEnsembleSensor(SensorEntity):
         # not make last-source/update diagnostics disappear.
         self._last_source = None
         self._last_update_diag = None
+
+        # Conservative online change-point detector for genuinely discrete
+        # regime changes.  It reacts only to several same-sign, very large
+        # innovations.  Normal continuous dynamics remain entirely under the
+        # x-v-a-j model.
+        self._regime_change_z_threshold = REGIME_CHANGE_Z_THRESHOLD
+        self._regime_change_confirmations = REGIME_CHANGE_CONFIRMATIONS
+        self._regime_candidate_sign = 0
+        self._regime_candidate_count = 0
+        self._regime_candidate_first_ts = None
+        self._regime_candidate_last_ts = None
+        self._regime_candidate_peak_z = 0.0
+        self._regime_candidate_values = []
+        self._regime_candidate_variances = []
+        self._regime_candidate_startup = False
+        self._regime_cooldown_until = 0.0
+        self._last_regime_change = None
+        # A full Recorder bootstrap can leave the latent level extrapolated a
+        # long way from the first live sample even though the historical model
+        # itself is healthy.  Treat the first few live observations as startup
+        # alignment evidence, not as physical regime-change events.
+        self._regime_startup_guard_updates = 3
+        self._regime_startup_guard_remaining = 0
+        self._regime_startup_reanchors = 0
+        self._startup_sync_replayed = 0
+        self._startup_sync_current = 0
+        self._startup_sync_gap_s = 0.0
+
+        # Last-line publication safety.  The Bayesian state continues to run
+        # internally, but if its published level becomes demonstrably worse
+        # than the direct observation we temporarily expose the untransported
+        # raw/fused level instead.  This protects users from runaway dynamics
+        # without teaching the filter the actuator/control logic.
+        self._fallback_active = False
+        self._fallback_value = None
+        self._fallback_variance = None
+        self._fallback_last_z = 0.0
+        self._fallback_reason = None
+        self._fallback_safe_count = 0
+        self._fallback_entries = 0
+        self._fallback_enter_z = 8.0
+        self._fallback_exit_z = 3.0
+        self._fallback_exit_confirmations = 5
+        self._fallback_derivative_weight_threshold = 0.01
+        self._fallback_last_event = None
+
         # Per-source live diagnostics.  These are presentation-only and are
         # deliberately kept outside SourceCalibration/persistence so adding
         # observability cannot change the estimator or stored calibration.
         self._source_last_diag: dict[str, dict] = {}
         self._ready = False
         self._last_save_ts = 0.0
-        self._checkpoint_version = 8
+        self._checkpoint_version = 10
         self._checkpoint_config_fingerprint = self._make_checkpoint_config_fingerprint()
         self._last_processed_by_source: dict[str, float] = {}
         self._startup_mode = "initializing"
@@ -321,9 +391,14 @@ class BayesianEnsembleSensor(SensorEntity):
             try:
                 await self._initialize()
             except Exception:
-                _LOGGER.exception("Bayesian State Filter 0.4.1 initialization failed")
+                _LOGGER.exception("Bayesian State Filter 0.5.0-dev.10 initialization failed")
                 await self._restore_fallback()
-            self._seed_current_sources()
+            # Finish hidden startup synchronization before publishing anything.
+            # Recorder catch-up plus the latest in-memory source states bridge the
+            # restart gap while the entity is still invisible to HA/Recorder.
+            await self._synchronize_startup_to_now()
+            self._regime_startup_guard_remaining = 0
+            self._reset_regime_candidate()
             self._ready = True
             if self._state is not None:
                 self.async_write_ha_state()
@@ -362,7 +437,7 @@ class BayesianEnsembleSensor(SensorEntity):
                 self._state = round(float(self.filter.x[0]), 6)
                 self._build_attrs(last_out=None)
             _LOGGER.info(
-                "Bayesian State Filter 0.4.1 restored checkpoint and caught up incrementally; t=%.3f",
+                "Bayesian State Filter 0.5.0-dev.10 restored checkpoint and caught up incrementally; t=%.3f",
                 float(self.filter.t_last or 0.0),
             )
             return
@@ -426,8 +501,9 @@ class BayesianEnsembleSensor(SensorEntity):
         if result.fused_points:
             self._last_characteristic_fit_ts = float(result.fused_points[-1][0])
 
-        # Identify q/timescale for the permanent confidence-gated [x,v,a,j]
-        # model.  Confidence itself is not fitted: c(z)=erf(|z|/sqrt(2)).
+        # Identify q/timescale and robust derivative plausibility for the permanent
+        # [x,v,a,j] model.  Effective derivative coupling is trained from the
+        # observed history; posterior significance remains diagnostic only.
         self._gated_dynamics = None
         dynamics_points = result.dynamics_points or result.fused_points
         if len(dynamics_points) >= 40:
@@ -444,6 +520,7 @@ class BayesianEnsembleSensor(SensorEntity):
             self.filter.tau = T
             self.filter.q_process = self._gated_dynamics.q_process
             self.filter.level_q_process = self._gated_dynamics.level_q_process
+            self._apply_derivative_plausibility()
 
         self._apply_noise_model()
 
@@ -455,11 +532,18 @@ class BayesianEnsembleSensor(SensorEntity):
             self._last_processed_by_source = {
                 src: float(seq[-1][0]) for src, seq in histories.items() if seq
             }
+            # Seed the live source cache with the exact tail already represented
+            # by the historical fused replay. This lets subsequent hidden
+            # Recorder catch-up fuse the first post-bootstrap source event with
+            # contemporaneous values from slower sources instead of waiting for
+            # every source to report again.
+            self._seed_source_cache_from_histories(histories)
+            await self._catch_up_from_recorder()
             self._state = round(float(self.filter.x[0]), 6)
             self._build_attrs(last_out=None)
             await self._save_state()
             _LOGGER.info(
-                "Bayesian State Filter 0.4.1 trained from %.2f d: gated_tau=%s q=%s level_q=%s "
+                "Bayesian State Filter 0.4.1-dev.15 trained from %.2f d: gated_tau=%s q=%s level_q=%s "
                 "local_rmse=%s characteristic_time=%s (status=%s, conf=%.3f)",
                 result.history_span / 86400.0,
                 (f"{self.filter.tau:.1f} s" if self._gated_dynamics is not None else "fallback"),
@@ -563,6 +647,123 @@ class BayesianEnsembleSensor(SensorEntity):
             st=st, write_state=True, allow_save=True, schedule_background=True,
         )
 
+    def _reset_regime_candidate(self):
+        self._regime_candidate_sign = 0
+        self._regime_candidate_count = 0
+        self._regime_candidate_first_ts = None
+        self._regime_candidate_last_ts = None
+        self._regime_candidate_peak_z = 0.0
+        self._regime_candidate_values = []
+        self._regime_candidate_variances = []
+        self._regime_candidate_startup = False
+
+    def _maybe_recover_regime_change(self, t: float, corrected: float, variance: float, out) -> bool:
+        """Detect a persistent *stable* discrete jump and recover level in-place.
+
+        Raw innovations drive detection, while the Student-t updater separately
+        clips one-step state corrections at three sigma.  A regime change must
+        therefore be both persistent and compact around a new level.  Wild
+        startup staircases/glitches can stay many sigma away for several samples
+        without being mistaken for a new physical regime.
+        """
+        if out is None or out.mode != "tracking" or out.dt <= 0:
+            self._reset_regime_candidate()
+            return False
+
+        now = float(t)
+        if now < float(self._regime_cooldown_until):
+            self._reset_regime_candidate()
+            return False
+
+        innovation = float(out.innovation)
+        innovation_var = max(float(out.innovation_var), NUMERIC_VARIANCE_FLOOR)
+        z = abs(innovation) / math.sqrt(innovation_var)
+
+        startup_sample = bool(self._ready and self._regime_startup_guard_remaining > 0)
+        if startup_sample:
+            self._regime_startup_guard_remaining -= 1
+
+        if (not math.isfinite(z)) or z < self._regime_change_z_threshold or innovation == 0.0:
+            self._reset_regime_candidate()
+            return False
+
+        sign = 1 if innovation > 0.0 else -1
+        gap_limit = max(30.0, 4.0 * max(float(out.dt), 1e-6))
+        same_event = (
+            self._regime_candidate_sign == sign
+            and self._regime_candidate_last_ts is not None
+            and now - float(self._regime_candidate_last_ts) <= gap_limit
+        )
+
+        if not same_event:
+            self._regime_candidate_sign = sign
+            self._regime_candidate_count = 1
+            self._regime_candidate_first_ts = now
+            self._regime_candidate_peak_z = z
+            self._regime_candidate_values = [float(corrected)]
+            self._regime_candidate_variances = [max(float(variance), NUMERIC_VARIANCE_FLOOR)]
+            self._regime_candidate_startup = startup_sample
+        else:
+            self._regime_candidate_count += 1
+            self._regime_candidate_peak_z = max(self._regime_candidate_peak_z, z)
+            self._regime_candidate_values.append(float(corrected))
+            self._regime_candidate_variances.append(max(float(variance), NUMERIC_VARIANCE_FLOOR))
+            self._regime_candidate_startup = self._regime_candidate_startup or startup_sample
+
+        # Keep only the confirmation window.  A true step settles around one
+        # new level; a startup/glitch staircase does not.
+        n = int(self._regime_change_confirmations)
+        if len(self._regime_candidate_values) > n:
+            self._regime_candidate_values = self._regime_candidate_values[-n:]
+            self._regime_candidate_variances = self._regime_candidate_variances[-n:]
+        self._regime_candidate_last_ts = now
+
+        if self._regime_candidate_count < n or len(self._regime_candidate_values) < n:
+            return False
+
+        vals = list(self._regime_candidate_values[-n:])
+        target = float(sorted(vals)[len(vals) // 2])
+        target_sigma = math.sqrt(max(
+            float(sorted(self._regime_candidate_variances[-n:])[len(vals) // 2]),
+            NUMERIC_VARIANCE_FLOOR,
+        ))
+        compact_limit = self._innovation_clip_sigma * target_sigma
+        compact = max(abs(v - target) for v in vals) <= compact_limit
+        if not compact:
+            # Preserve the latest window and wait for a genuinely stable new
+            # level instead of snapping to a multi-point transient.
+            self._regime_candidate_count = n
+            return False
+
+        old_level = float(self.filter.x[0])
+        jump = target - old_level
+        evidence = {
+            "timestamp": now,
+            "jump": jump,
+            "innovation": innovation,
+            "peak_z": float(self._regime_candidate_peak_z),
+            "confirmations": n,
+            "direction": "up" if sign > 0 else "down",
+        }
+
+        self.filter.recover_level_jump(target, max(float(variance), NUMERIC_VARIANCE_FLOOR), t=now)
+        if self._regime_candidate_startup:
+            self._regime_startup_reanchors += 1
+            _LOGGER.info(
+                "Bayesian State Filter startup re-anchor after stable confirmation: "
+                "jump=%+.6g z_peak=%.3f",
+                jump, evidence["peak_z"],
+            )
+        else:
+            self._last_regime_change = evidence
+            _LOGGER.info(
+                "Bayesian State Filter regime change recovered: jump=%+.6g z_peak=%.3f",
+                jump, evidence["peak_z"],
+            )
+        self._regime_cooldown_until = now + max(30.0, 4.0 * max(float(out.dt), 1e-6))
+        self._reset_regime_candidate()
+        return True
+
     async def _process_sample(self, src: str, raw: float, t: float, *, st=None,
                               write_state: bool, allow_save: bool,
                               schedule_background: bool):
@@ -616,6 +817,8 @@ class BayesianEnsembleSensor(SensorEntity):
             meta={"trigger_source": src, "raw": raw, "bias": cal.bias},
         ))
 
+        regime_recovered = self._maybe_recover_regime_change(t, corrected, variance, out)
+
         # Source health is diagnostic evidence about the triggering source
         # relative to the contemporaneous ensemble, not the Kalman innovation
         # of the fused measurement. This avoids attributing a common process
@@ -652,7 +855,13 @@ class BayesianEnsembleSensor(SensorEntity):
         if schedule_background:
             self._maybe_schedule_characteristic_fit(t)
             self._maybe_schedule_bias_history_refit(t)
-        self._state = round(out.y_mean, 6)
+
+        # Publication safety is deliberately evaluated after the Bayesian step
+        # and regime-change logic.  The latent filter always keeps learning;
+        # only the value exposed to HA can fall back to direct raw/fused data.
+        self._update_raw_fallback(t, regime_recovered=regime_recovered)
+        bayes_level = float(self.filter.x[0]) if regime_recovered else float(out.y_mean)
+        self._state = round(self._published_level(bayes_level), 6)
         self._last_source = src
         self._remember_update_diag(out)
         # Keep estimator hot-path and HA publication cadence independent.
@@ -677,8 +886,13 @@ class BayesianEnsembleSensor(SensorEntity):
             await self._save_state()
 
 
-    async def _catch_up_from_recorder(self):
-        """Replay only source observations newer than the persisted watermarks."""
+    async def _catch_up_from_recorder(self) -> int:
+        """Replay only source observations newer than persisted watermarks.
+
+        The replay is intentionally silent: callers use it during startup before
+        the first HA state publication so restart gaps affect covariance/state
+        internally without drawing a synthetic discontinuity in Recorder.
+        """
         events = []
         global_floor = float(self.filter.t_last or 0.0)
         for src in self.sources:
@@ -713,6 +927,111 @@ class BayesianEnsembleSensor(SensorEntity):
             self._build_attrs(last_out=None)
             await self._save_state()
         _LOGGER.info("Bayesian State Filter incremental catch-up replayed %d source observations", replayed)
+        return replayed
+
+    def _seed_source_cache_from_histories(self, histories):
+        """Seed source cache from historical tails without updating the filter.
+
+        Those samples are already represented by ``_replay_fused``. Replaying
+        them again would double-count evidence, but retaining their per-source
+        values/timestamps is required for a causal ensemble catch-up.
+        """
+        if self._source_cal is None:
+            return
+        for src, seq in (histories or {}).items():
+            if not seq or src not in self._calibrations:
+                continue
+            t, raw = seq[-1]
+            self._source_cal.ensure_source(src, float(raw), float(t))
+
+    async def _synchronize_startup_to_now(self):
+        """Bring restored/trained state to current source time before publication.
+
+        Startup has two hidden bridges:
+          1. replay any Recorder rows that appeared while initialization ran;
+          2. replay newer in-memory HA source states that Recorder has not flushed
+             yet. Older/current-equal states only seed the source cache and are
+             never double-counted by the Kalman filter.
+
+        The entity remains ``_ready == False`` throughout, so no intermediate
+        state can leak into HA history.
+        """
+        before = float(self.filter.t_last or 0.0)
+        replayed = await self._catch_up_from_recorder()
+        self._startup_sync_replayed += int(replayed)
+
+        if self._source_cal is None:
+            self._source_cal = OnlineSourceCalibrator(
+                self._calibrations, bias_anchor=self._bias_anchor,
+                source_models=self._source_models, model_accuracy=self._model_accuracy,
+                huber_delta=self._bias_huber_delta,
+            )
+
+        baseline = []
+        pending = []
+        global_t = float(self.filter.t_last or 0.0)
+        for src in self.sources:
+            st = self.hass.states.get(src)
+            if not st or st.state in ("unknown", "unavailable", None):
+                continue
+            try:
+                raw = float(st.state)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(raw):
+                continue
+            self._inherit_metadata(st)
+            t = float(self._state_timestamp(st))
+            watermark = float(self._last_processed_by_source.get(src, float("-inf")))
+            # If Recorder/filter already consumed this timestamp, we only need
+            # its value in the per-source cache. Never step the filter backwards.
+            if t <= watermark + 1e-6 or t <= global_t + 1e-6:
+                baseline.append((t, src, raw))
+            else:
+                pending.append((t, src, raw))
+
+        for t, src, raw in sorted(baseline):
+            if src in self._calibrations:
+                self._source_cal.ensure_source(src, raw, t)
+
+        current_replayed = 0
+        for t, src, raw in sorted(pending, key=lambda x: (x[0], x[1])):
+            await self._process_sample(
+                src, raw, t, st=None, write_state=False, allow_save=False,
+                schedule_background=False,
+            )
+            current_replayed += 1
+
+        self._startup_sync_current += current_replayed
+        after = float(self.filter.t_last or before)
+        if before > 0.0 and after >= before:
+            self._startup_sync_gap_s = max(self._startup_sync_gap_s, after - before)
+
+        if self.filter.t_last is not None:
+            self._state = round(float(self.filter.x[0]), 6)
+            self._build_attrs(last_out=None)
+        if replayed or current_replayed:
+            await self._save_state()
+
+        _LOGGER.info(
+            "Bayesian State Filter startup sync complete: recorder=%d current=%d gap=%.3f s t=%.3f",
+            replayed, current_replayed, self._startup_sync_gap_s,
+            float(self.filter.t_last or 0.0),
+        )
+
+    def _apply_derivative_plausibility(self):
+        """Install history-trained v/a/j plausibility scales in the state model."""
+        model = self.filter.state_model
+        if not hasattr(model, "set_derivative_plausibility"):
+            return
+        gd = self._gated_dynamics
+        if gd is None:
+            return
+        model.set_derivative_plausibility(
+            scales=gd.derivative_scales,
+            centers=gd.derivative_centers,
+            samples=gd.derivative_samples,
+        )
 
     def _update_dynamics(self, t, corrected, variance, dt):
         # Structural q/timescale are identified from history and persisted.
@@ -836,12 +1155,20 @@ class BayesianEnsembleSensor(SensorEntity):
                 }
         return fused, fused_var, components
 
-    def _current_fused_snapshot(self, now, *, with_components=False):
+    def _current_observed_snapshot(self, now, *, with_components=False):
+        """Return a direct raw/fused observation with *no* state transport.
+
+        This is intentionally independent of x/v/a/j.  It is used only as a
+        safety reference/output fallback so a bad latent trajectory cannot
+        manufacture the evidence that is supposed to reject that trajectory.
+        Source bias/noise calibration and the normal freshness rules are still
+        respected.
+        """
         if self._source_cal is None:
             return None
         values, variances, labels = [], [], []
         tau = self._window_tau()
-        mode = self._noise_model_name
+        mode = self._runtime_noise_mode
         for src, (t_src, raw) in self._source_cal.cache.items():
             cal = self._calibrations.get(src)
             if cal is None:
@@ -855,7 +1182,149 @@ class BayesianEnsembleSensor(SensorEntity):
             if age > max_age:
                 continue
             corrected = float(raw) - float(cal.bias)
-            base_var = cal.variance(corrected, noise_mode=mode)
+            variance = cal.variance(
+                corrected,
+                noise_mode=mode,
+                level_fraction=self._runtime_level_fraction,
+            )
+            if not (math.isfinite(corrected) and math.isfinite(variance)):
+                continue
+            values.append(corrected)
+            variances.append(max(float(variance), NUMERIC_VARIANCE_FLOOR))
+            labels.append(src)
+        if len(values) < self.min_sources:
+            return None
+        fused = self._robust_fuse(values, variances, labels)
+        if fused is None:
+            return None
+        z, var, components = fused
+        if with_components:
+            return z, var, components
+        return z, var
+
+    def _update_raw_fallback(self, now: float, *, regime_recovered: bool = False):
+        """Update publication-only raw/fused fallback with hysteresis.
+
+        Entry requires a gross level disagreement plus corroborating evidence:
+        either a persistent regime-change candidate or collapsed derivative
+        plausibility.  This avoids turning one isolated raw outlier into a
+        published spike.  Exit requires sustained agreement, except after a
+        confirmed level re-anchor where the latent state is already reset to
+        the observation and fallback can end immediately.
+        """
+        obs = self._current_observed_snapshot(now)
+        if obs is None:
+            return
+        observed, observed_var = obs
+        self._fallback_value = float(observed)
+        self._fallback_variance = max(float(observed_var), NUMERIC_VARIANCE_FLOOR)
+
+        finite_state = (
+            np.all(np.isfinite(self.filter.x))
+            and np.all(np.isfinite(self.filter.P))
+            and math.isfinite(float(self.filter.x[0]))
+        )
+        if finite_state:
+            level_var = max(float(self.filter.P[0, 0]), NUMERIC_VARIANCE_FLOOR)
+            denom = math.sqrt(max(level_var + self._fallback_variance, NUMERIC_VARIANCE_FLOOR))
+            level_z = abs(float(self.filter.x[0]) - self._fallback_value) / denom
+        else:
+            level_z = float('inf')
+        self._fallback_last_z = float(level_z)
+
+        weights = np.ones(len(self.filter.x), dtype=float)
+        try:
+            if hasattr(self.filter.state_model, 'effective_weights'):
+                weights = self.filter.state_model.effective_weights(
+                    self.filter.x, self.filter.P, max(float(getattr(self, '_level_grid_step', 1.0)), 1e-6)
+                )
+        except Exception:
+            pass
+        derivative_collapsed = (
+            len(weights) > 1
+            and float(np.min(weights[1:])) <= self._fallback_derivative_weight_threshold
+        )
+        persistent_jump = self._regime_candidate_count >= 2
+
+        if regime_recovered and finite_state:
+            # recover_level_jump() snapped level and cleared old derivatives.
+            # If it is now close to observation, returning to Bayesian output is
+            # safe immediately and avoids an unnecessary raw plateau.
+            if level_z <= self._fallback_exit_z:
+                self._fallback_active = False
+                self._fallback_safe_count = 0
+                self._fallback_reason = None
+                return
+
+        unsafe = (
+            not finite_state
+            or (
+                level_z >= self._fallback_enter_z
+                and (persistent_jump or derivative_collapsed)
+            )
+        )
+
+        if not self._fallback_active:
+            if unsafe:
+                self._fallback_active = True
+                self._fallback_safe_count = 0
+                self._fallback_entries += 1
+                if not finite_state:
+                    reason = 'nonfinite_state'
+                elif persistent_jump and derivative_collapsed:
+                    reason = 'level_divergence+regime_candidate+derivative_collapse'
+                elif persistent_jump:
+                    reason = 'level_divergence+regime_candidate'
+                else:
+                    reason = 'level_divergence+derivative_collapse'
+                self._fallback_reason = reason
+                self._fallback_last_event = {
+                    'timestamp': float(now),
+                    'z': float(level_z),
+                    'reason': reason,
+                }
+            return
+
+        # Fallback is already active. Stay conservative until latent level and
+        # direct observation agree for several consecutive source updates.
+        if finite_state and level_z <= self._fallback_exit_z:
+            self._fallback_safe_count += 1
+            if self._fallback_safe_count >= self._fallback_exit_confirmations:
+                self._fallback_active = False
+                self._fallback_safe_count = 0
+                self._fallback_reason = None
+        else:
+            self._fallback_safe_count = 0
+
+    def _published_level(self, bayes_level: float) -> float:
+        if self._fallback_active and self._fallback_value is not None:
+            return float(self._fallback_value)
+        return float(bayes_level)
+
+    def _current_fused_snapshot(self, now, *, with_components=False):
+        if self._source_cal is None:
+            return None
+        values, variances, labels = [], [], []
+        tau = self._window_tau()
+        mode = self._runtime_noise_mode
+        for src, (t_src, raw) in self._source_cal.cache.items():
+            cal = self._calibrations.get(src)
+            if cal is None:
+                continue
+            age = max(float(now) - float(t_src), 0.0)
+            max_age = max(
+                FRESHNESS_MEDIAN_DT_MULTIPLIER * cal.median_dt,
+                FRESHNESS_TAU_FRACTION * tau,
+                FRESHNESS_MIN_S,
+            )
+            if age > max_age:
+                continue
+            corrected = float(raw) - float(cal.bias)
+            base_var = cal.variance(
+                corrected,
+                noise_mode=mode,
+                level_fraction=self._runtime_level_fraction,
+            )
 
             # A source is not stale merely because it has not published again
             # before its normal reporting cadence.  This matters especially for
@@ -1166,6 +1635,7 @@ class BayesianEnsembleSensor(SensorEntity):
                         self.filter.tau = T
                         self.filter.q_process = self._gated_dynamics.q_process
                         self.filter.level_q_process = self._gated_dynamics.level_q_process
+                        self._apply_derivative_plausibility()
                         self._clear_warmup_history()
                     except Exception:
                         _LOGGER.exception("Bayesian State Filter warmup gated dynamics training failed")
@@ -1234,6 +1704,8 @@ class BayesianEnsembleSensor(SensorEntity):
             "bias_huber_delta": float(self._bias_huber_delta),
             "noise_model": self._noise_mode_cfg,
             "noise_detection_version": int(self._noise_detection_version),
+            "innovation_clip_sigma": float(self._innovation_clip_sigma),
+            "regime_stability_version": 1,
             "bias_history_version": 1,
         }
         # Single-source observation-noise calibration has its own schema.
@@ -1320,6 +1792,7 @@ class BayesianEnsembleSensor(SensorEntity):
             self._dynamics = None
             self._gated_dynamics = GatedDynamicsEstimate.load(saved.get("gated_dynamics"))
             if self._gated_dynamics is not None:
+                self._apply_derivative_plausibility()
                 self._clear_warmup_history()
             c = saved.get("characteristic") or {}
             self._characteristic = CharacteristicTimeEstimate.load(c) if c else None
@@ -1423,6 +1896,51 @@ class BayesianEnsembleSensor(SensorEntity):
                 float(self._noise_detection.quantization_confidence), 4
             )
 
+        if self._noise_mode_cfg == "auto" and self._noise_detection.level_variance_reason is not None:
+            local_active = (
+                self._runtime_variance_source == "local_variance_law"
+                and self._runtime_level_fraction > 0.0
+            )
+            params["local_variance_law"] = {
+                "model": "constant_plus_level",
+                "level_fraction": (
+                    None if self._noise_detection.level_variance_fraction is None
+                    else round(float(self._noise_detection.level_variance_fraction), 4)
+                ),
+                "confidence": round(float(self._noise_detection.level_variance_confidence), 4),
+                "reference_level": (
+                    None if self._noise_detection.level_variance_reference is None
+                    else round(float(self._noise_detection.level_variance_reference), 10)
+                ),
+                "reason": self._noise_detection.level_variance_reason,
+                "span_z": (
+                    None if self._noise_detection.level_variance_span_z is None
+                    else round(float(self._noise_detection.level_variance_span_z), 3)
+                ),
+                "boundary_limited": bool(
+                    self._noise_detection.level_variance_boundary_limited
+                ),
+                "fraction_identifiable": bool(
+                    self._noise_detection.level_variance_fraction is not None
+                    and not self._noise_detection.level_variance_boundary_limited
+                ),
+                "active": bool(local_active),
+            }
+
+        runtime_boundary = bool(
+            self._runtime_variance_source == "local_variance_law"
+            and self._noise_detection.level_variance_boundary_limited
+        )
+        params["runtime_variance_model"] = {
+            "model": "constant_plus_level",
+            "level_fraction": round(float(self._runtime_level_fraction), 4),
+            "additive_fraction": round(1.0 - float(self._runtime_level_fraction), 4),
+            "source": self._runtime_variance_source,
+            "boundary_limited": runtime_boundary,
+            "fraction_identifiable": not runtime_boundary,
+            "active": True,
+        }
+
         if self._noise_model_name == "poisson":
             k = self._noise_detection.poisson_scale
             if k is None and self._last_source is not None:
@@ -1447,6 +1965,9 @@ class BayesianEnsembleSensor(SensorEntity):
             "innovation": float(out.innovation),
             "z_score": float(z),
             "robust_weight": float(out.diag.get("weight", 1.0)),
+            "innovation_used": float(out.diag.get("innovation_used", out.innovation)),
+            "innovation_clipped": bool(out.diag.get("innovation_clipped", False)),
+            "clip_sigma": out.diag.get("clip_sigma"),
             "measurement_variance": float(measurement_var),
             "measurement_sigma": math.sqrt(max(float(measurement_var), 0.0)),
             "update_dt_s": float(out.dt),
@@ -1459,32 +1980,33 @@ class BayesianEnsembleSensor(SensorEntity):
         }
 
     def _build_attrs(self, last_out):
-        """Build user-facing diagnostics without changing estimator behavior.
+        """Build the public entity surface and optional laboratory diagnostics.
 
-        ``compact`` is the public/default surface.  ``full`` restores the
-        laboratory diagnostics from 2.1.0 for troubleshooting and research.
+        ``minimal`` keeps only the operational essentials, ``normal`` is the
+        default human-readable surface, and ``debug`` adds the full laboratory
+        detail under one nested ``debug`` key.  No flat compatibility aliases
+        are emitted: each diagnostic has exactly one public location.
         """
-        # Take one atomic numerical snapshot for every state-derived public
-        # diagnostic.  The estimator can be updated independently of the
-        # slower attribute publication cadence, so mixing separate reads of x
-        # and P can otherwise expose an internally inconsistent diagnostic
-        # tuple (most visibly jerk / jerk_stddev / jerk_z).
         x_diag = np.array(self.filter.x, dtype=float, copy=True)
         P_diag = np.array(self.filter.P, dtype=float, copy=True)
 
         var = max(float(P_diag[0, 0]), 0.0)
+        if self._fallback_active and self._fallback_variance is not None:
+            var = max(float(self._fallback_variance), NUMERIC_VARIANCE_FLOOR)
+
         velocity = float(x_diag[1]) if len(x_diag) > 1 else 0.0
         acceleration = float(x_diag[2]) if len(x_diag) > 2 else 0.0
         jerk = float(x_diag[3]) if len(x_diag) > 3 else 0.0
         dt_weight = self._level_grid_step
         if self._last_update_diag is not None:
             dt_weight = max(float(self._last_update_diag.get("update_dt_s", dt_weight)), 1e-6)
+
         model = self.filter.state_model
         if hasattr(model, "effective_weights"):
             eff_w = model.effective_weights(x_diag, P_diag, dt_weight)
             conf_w = model.confidence_weights(x_diag, P_diag)
         else:
-            eff_w = [1.0] * len(self.filter.x)
+            eff_w = [1.0] * len(x_diag)
             conf_w = eff_w
 
         def _sigma(order):
@@ -1492,220 +2014,386 @@ class BayesianEnsembleSensor(SensorEntity):
                 return 0.0
             return math.sqrt(max(float(P_diag[order, order]), NUMERIC_VARIANCE_FLOOR))
 
-        def _z(order):
+        def _posterior_z(order):
             sigma = _sigma(order)
             if sigma <= 0.0 or order >= len(x_diag):
                 return 0.0
             return abs(float(x_diag[order])) / sigma
 
-        # Compact public surface.  Group related diagnostics so the entity
-        # remains readable in Home Assistant.  The old flat attributes are
-        # retained for one compatibility cycle below.
-        anchor_diag = self._source_cal.last_anchor if self._source_cal is not None else None
+        def _round_ratio(mean_value, scale_value):
+            try:
+                mean_value = float(mean_value)
+                scale_value = float(scale_value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(mean_value) or not math.isfinite(scale_value) or scale_value <= 0.0:
+                return None
+            return round(mean_value / scale_value, 6)
+
+        # Remember one internally consistent observation/update record before
+        # building either the normal or debug surface.
+        if last_out is not None:
+            self._remember_update_diag(last_out)
+
+        pp = (
+            model.derivative_plausibility_parameters()
+            if hasattr(model, "derivative_plausibility_parameters") else {}
+        )
+        scales = list(pp.get("scales", []) or [])
+        centers = list(pp.get("centers", []) or [])
+        samples = list(pp.get("samples", []) or [])
+        gd = self._gated_dynamics
+        means = list(getattr(gd, "derivative_means", []) or []) if gd is not None else []
+        training_diag = dict(
+            getattr(gd, "derivative_training_diagnostics", {}) or {}
+        ) if gd is not None else {}
+
+        def _scale(order):
+            if len(scales) <= order:
+                return None
+            value = float(scales[order])
+            return value if math.isfinite(value) and value > 0.0 else None
+
+        def _mean(order):
+            if len(means) <= order:
+                return None
+            value = float(means[order])
+            return value if math.isfinite(value) else None
+
+        def _center(order):
+            if len(centers) <= order:
+                return None
+            value = float(centers[order])
+            return value if math.isfinite(value) else None
+
+        rate_scale = _scale(1)
+        curvature_scale = _scale(2)
+        jerk_scale = _scale(3)
 
         dynamics = {
             "rate": {
                 "value_per_hour": round(velocity * 3600.0, 10),
-                "stddev_per_hour": round(_sigma(1) * 3600.0, 10),
-                "z": round(_z(1), 4),
                 "weight": round(float(eff_w[1]), 6) if len(eff_w) > 1 else 0.0,
             },
             "curvature": {
                 "value_per_hour2": round(acceleration * (3600.0 ** 2), 10),
-                "stddev_per_hour2": round(_sigma(2) * (3600.0 ** 2), 10),
-                "z": round(_z(2), 4),
                 "weight": round(float(eff_w[2]), 6) if len(eff_w) > 2 else 0.0,
             },
             "jerk": {
                 "value_per_hour3": round(jerk * (3600.0 ** 3), 10),
-                "stddev_per_hour3": round(_sigma(3) * (3600.0 ** 3), 10),
-                "z": round(_z(3), 4),
                 "weight": round(float(eff_w[3]), 6) if len(eff_w) > 3 else 0.0,
             },
-        }
-
-        timescales = {
-            "gated": {
-                "timescale_s": round(float(self.filter.tau), 3),
-                "local_rmse": None,
-                "local_rmse_step1": None,
-                "local_rmse_step2": None,
-            },
-            "characteristic": {
-                "time_s": None,
-                "p10_s": None,
-                "p90_s": None,
-                "confidence": 0.0,
-                "status": "unavailable",
-                "identifiable": False,
-                "boundary_limited": False,
+            "plausibility": {
+                "rate_sigma_per_hour": (
+                    round(rate_scale * 3600.0, 10) if rate_scale is not None else None
+                ),
+                "curvature_sigma_per_hour2": (
+                    round(curvature_scale * (3600.0 ** 2), 10)
+                    if curvature_scale is not None else None
+                ),
+                "jerk_sigma_per_hour3": (
+                    round(jerk_scale * (3600.0 ** 3), 10)
+                    if jerk_scale is not None else None
+                ),
+                "rate_mean_over_sigma": _round_ratio(_mean(1), rate_scale),
+                "curvature_mean_over_sigma": _round_ratio(_mean(2), curvature_scale),
+                "jerk_mean_over_sigma": _round_ratio(_mean(3), jerk_scale),
             },
         }
-        if self._gated_dynamics is not None:
-            timescales["gated"].update({
-                "local_rmse": round(float(self._gated_dynamics.validation_rmse), 10),
-                "local_rmse_step1": round(float(self._gated_dynamics.validation_rmse_step1), 10),
-                "local_rmse_step2": round(float(self._gated_dynamics.validation_rmse_step2), 10),
-            })
 
-        if self._characteristic is not None:
-            c = self._characteristic
-            timescales["characteristic"].update({
-                "time_s": self._round_optional(c.tau),
-                "p10_s": self._round_optional(c.p10),
-                "p90_s": self._round_optional(c.p90),
-                "confidence": round(c.confidence, 4),
-                "status": c.status,
-                "identifiable": bool(c.identifiable),
-                "boundary_limited": bool(c.boundary_limited),
-            })
-
-        calibration = {
-            "bias_anchor_mode": self._bias_anchor,
-            "bias_anchor_last_shift": (round(float(anchor_diag.shift), 10) if anchor_diag else 0.0),
-            "noise_variance_source": ("per_source_calibration" if self._calibrations else "model_default"),
+        # Compact operational source summary.  Detailed per-source calibration
+        # lives only in debug mode.
+        health = self._source_health()
+        unhealthy = []
+        for src, item in health.items():
+            last_z = item.get("last_z_score")
+            weight = item.get("robust_weight")
+            if (
+                (last_z is not None and float(last_z) >= self._regime_change_z_threshold)
+                or (weight is not None and float(weight) <= STUDENT_T_MIN_WEIGHT + 1e-12)
+            ):
+                unhealthy.append(src)
+        active_sources = len(getattr(self._source_cal, "cache", {}) or {}) if self._source_cal else 0
+        sources_summary = {
+            "configured": len(self.sources),
+            "active": active_sources,
+            "unhealthy": len(unhealthy),
         }
-        if anchor_diag and anchor_diag.model_centers:
-            calibration["bias_anchor_models"] = {
-                model_name: {
-                    "center": round(float(center), 8),
-                    "absolute_accuracy": round(float(self._model_accuracy.get(model_name, 0.0)), 8),
-                    "effective_weight": round(float((anchor_diag.model_weights or {}).get(model_name, 0.0)), 8),
-                }
-                for model_name, center in anchor_diag.model_centers.items()
-            }
+        if unhealthy:
+            sources_summary["unhealthy_entities"] = unhealthy
+
+        filter_summary = {
+            "mode": self._mode_name(),
+            "noise_model": self._noise_model_name,
+        }
+        if self._noise_mode_cfg == "auto":
+            filter_summary["noise_confidence"] = round(float(self._noise_detection.confidence), 4)
+
+        fallback = {
+            "active": bool(self._fallback_active),
+        }
+        if self._fallback_active:
+            fallback.update({
+                "reason": self._fallback_reason,
+                "level_z": (
+                    round(float(self._fallback_last_z), 4)
+                    if math.isfinite(float(self._fallback_last_z)) else None
+                ),
+                "observed_level": (
+                    round(float(self._fallback_value), 10)
+                    if self._fallback_value is not None else None
+                ),
+            })
+
+        regime = {
+            "candidate": bool(self._regime_candidate_count > 0),
+        }
+        if self._regime_candidate_count > 0:
+            regime.update({
+                "confirmations": int(self._regime_candidate_count),
+                "direction": (
+                    "up" if self._regime_candidate_sign > 0
+                    else "down" if self._regime_candidate_sign < 0
+                    else None
+                ),
+                "peak_z": round(float(self._regime_candidate_peak_z), 4),
+            })
+        if self._last_regime_change is not None:
+            regime["last_jump"] = round(float(self._last_regime_change["jump"]), 10)
+            regime["last_direction"] = self._last_regime_change["direction"]
 
         attrs = {
             ATTR_STDDEV: round(math.sqrt(var), 10),
-            "model": {
-                "filter_mode": self._mode_name(),
-                "noise_model_mode": self._noise_mode_cfg,
-                "noise_model": self._noise_model_name,
-                "noise_model_params": self._noise_model_params(),
-            },
-            "calibration": calibration,
+            "filter": filter_summary,
             "dynamics": dynamics,
-            "timescales": timescales,
-            "startup": {
-                "mode": self._startup_mode,
-                "checkpoint_store_key": self._store_key,
-            },
-            ATTR_SOURCE_HEALTH: self._source_health(),
+            "fallback": fallback,
         }
 
-        # Show one internally consistent observation/update record. These
-        # values all refer to the same source and the same Bayesian update.
-        if last_out is not None:
-            self._remember_update_diag(last_out)
-        if self._last_update_diag is not None:
-            d = self._last_update_diag
-            attrs["last_update"] = {
-                "source": self._last_source,
-                "measurement_sigma": round(d["measurement_sigma"], 10),
-                "measurement_variance": round(d["measurement_variance"], 10),
-                "innovation": round(d["innovation"], 10),
-                "z_score": round(d["z_score"], 4),
-                "robust_weight": round(d["robust_weight"], 6),
-                "update_dt_s": round(d["update_dt_s"], 3),
+        if self._diagnostics_mode != "minimal":
+            attrs["regime"] = regime
+            attrs["sources"] = sources_summary
+            if self._last_update_diag is not None:
+                d = self._last_update_diag
+                attrs["last_update"] = {
+                    "source": self._last_source,
+                    "innovation_z": round(d["z_score"], 4),
+                    "clipped": bool(d["innovation_clipped"]),
+                    "dt_s": round(d["update_dt_s"], 3),
+                }
+                if d["innovation_clipped"]:
+                    attrs["last_update"].update({
+                        "innovation": round(d["innovation"], 10),
+                        "innovation_used": round(d["innovation_used"], 10),
+                        "clip_sigma": d["clip_sigma"],
+                    })
+
+        if self._diagnostics_mode == "debug":
+            anchor_diag = self._source_cal.last_anchor if self._source_cal is not None else None
+            calibration = {
+                "bias_anchor_mode": self._bias_anchor,
+                "bias_anchor_last_shift": (
+                    round(float(anchor_diag.shift), 10) if anchor_diag else 0.0
+                ),
+                "noise_variance_source": (
+                    "per_source_calibration" if self._calibrations else "model_default"
+                ),
+            }
+            if anchor_diag and anchor_diag.model_centers:
+                calibration["bias_anchor_models"] = {
+                    model_name: {
+                        "center": round(float(center), 8),
+                        "absolute_accuracy": round(
+                            float(self._model_accuracy.get(model_name, 0.0)), 8
+                        ),
+                        "effective_weight": round(
+                            float((anchor_diag.model_weights or {}).get(model_name, 0.0)), 8
+                        ),
+                    }
+                    for model_name, center in anchor_diag.model_centers.items()
+                }
+
+            timescales = {
+                "gated": {
+                    "timescale_s": round(float(self.filter.tau), 3),
+                    "local_rmse": None,
+                    "local_rmse_step1": None,
+                    "local_rmse_step2": None,
+                },
+                "characteristic": {
+                    "time_s": None,
+                    "p10_s": None,
+                    "p90_s": None,
+                    "confidence": 0.0,
+                    "status": "unavailable",
+                    "identifiable": False,
+                    "boundary_limited": False,
+                },
+            }
+            if self._gated_dynamics is not None:
+                timescales["gated"].update({
+                    "local_rmse": round(float(self._gated_dynamics.validation_rmse), 10),
+                    "local_rmse_step1": round(float(self._gated_dynamics.validation_rmse_step1), 10),
+                    "local_rmse_step2": round(float(self._gated_dynamics.validation_rmse_step2), 10),
+                })
+            if self._characteristic is not None:
+                c = self._characteristic
+                timescales["characteristic"].update({
+                    "time_s": self._round_optional(c.tau),
+                    "p10_s": self._round_optional(c.p10),
+                    "p90_s": self._round_optional(c.p90),
+                    "confidence": round(c.confidence, 4),
+                    "status": c.status,
+                    "identifiable": bool(c.identifiable),
+                    "boundary_limited": bool(c.boundary_limited),
+                })
+
+            derivative_debug = {
+                "law": pp.get("law"),
+                "hierarchy": "cumulative_lower_order_penalties",
+                "cutoff_sigma": pp.get("cutoff_sigma"),
+                "regime_segmentation": "same_6sigma_3_confirmation_compact_plateau_semantics",
+                "posterior": {
+                    "rate_sigma_per_hour": round(_sigma(1) * 3600.0, 10),
+                    "curvature_sigma_per_hour2": round(_sigma(2) * (3600.0 ** 2), 10),
+                    "jerk_sigma_per_hour3": round(_sigma(3) * (3600.0 ** 3), 10),
+                    "rate_z": round(_posterior_z(1), 4),
+                    "curvature_z": round(_posterior_z(2), 4),
+                    "jerk_z": round(_posterior_z(3), 4),
+                    "confidence_weights": [round(float(v), 6) for v in conf_w[1:4]],
+                },
+                "training": {
+                    "rate_median_per_hour": (
+                        round(_center(1) * 3600.0, 10) if _center(1) is not None else None
+                    ),
+                    "curvature_median_per_hour2": (
+                        round(_center(2) * (3600.0 ** 2), 10) if _center(2) is not None else None
+                    ),
+                    "jerk_median_per_hour3": (
+                        round(_center(3) * (3600.0 ** 3), 10) if _center(3) is not None else None
+                    ),
+                    "rate_mean_per_hour": (
+                        round(_mean(1) * 3600.0, 10) if _mean(1) is not None else None
+                    ),
+                    "curvature_mean_per_hour2": (
+                        round(_mean(2) * (3600.0 ** 2), 10) if _mean(2) is not None else None
+                    ),
+                    "jerk_mean_per_hour3": (
+                        round(_mean(3) * (3600.0 ** 3), 10) if _mean(3) is not None else None
+                    ),
+                    "samples": list(samples[1:4]) if len(samples) >= 4 else list(samples),
+                    **training_diag,
+                },
             }
 
-        # Compatibility layer for 0.4.1-era templates/automations.  Keep these
-        # flat aliases for one release cycle; new consumers should use the
-        # grouped dictionaries above.
-        attrs.update({
-            "bias_anchor_mode": calibration["bias_anchor_mode"],
-            "bias_anchor_last_shift": calibration["bias_anchor_last_shift"],
-            "startup_mode": self._startup_mode,
-            "checkpoint_store_key": self._store_key,
-            ATTR_FILTER_MODE: self._mode_name(),
-            ATTR_NOISE_MODEL_MODE: self._noise_mode_cfg,
-            ATTR_NOISE_MODEL: self._noise_model_name,
-            ATTR_NOISE_MODEL_PARAMS: self._noise_model_params(),
-            ATTR_NOISE_VARIANCE_SOURCE: calibration["noise_variance_source"],
-            ATTR_RATE_PER_HOUR: dynamics["rate"]["value_per_hour"],
-            ATTR_RATE_STDDEV_PER_HOUR: dynamics["rate"]["stddev_per_hour"],
-            ATTR_CURVATURE_PER_HOUR2: dynamics["curvature"]["value_per_hour2"],
-            ATTR_CURVATURE_STDDEV_PER_HOUR2: dynamics["curvature"]["stddev_per_hour2"],
-            ATTR_JERK_PER_HOUR3: dynamics["jerk"]["value_per_hour3"],
-            ATTR_JERK_STDDEV_PER_HOUR3: dynamics["jerk"]["stddev_per_hour3"],
-            ATTR_RATE_WEIGHT: dynamics["rate"]["weight"],
-            ATTR_CURVATURE_WEIGHT: dynamics["curvature"]["weight"],
-            ATTR_JERK_WEIGHT: dynamics["jerk"]["weight"],
-            ATTR_RATE_Z: dynamics["rate"]["z"],
-            ATTR_CURVATURE_Z: dynamics["curvature"]["z"],
-            ATTR_JERK_Z: dynamics["jerk"]["z"],
-            ATTR_GATED_TIMESCALE: timescales["gated"]["timescale_s"],
-            ATTR_GATED_LOCAL_RMSE: timescales["gated"]["local_rmse"],
-            ATTR_GATED_LOCAL_RMSE_STEP1: timescales["gated"]["local_rmse_step1"],
-            ATTR_GATED_LOCAL_RMSE_STEP2: timescales["gated"]["local_rmse_step2"],
-            ATTR_CHARACTERISTIC_TIME: timescales["characteristic"]["time_s"],
-            ATTR_CHARACTERISTIC_TIME_P10: timescales["characteristic"]["p10_s"],
-            ATTR_CHARACTERISTIC_TIME_P90: timescales["characteristic"]["p90_s"],
-            ATTR_CHARACTERISTIC_TIME_CONFIDENCE: timescales["characteristic"]["confidence"],
-            ATTR_CHARACTERISTIC_TIME_STATUS: timescales["characteristic"]["status"],
-            ATTR_CHARACTERISTIC_TIME_IDENTIFIABLE: timescales["characteristic"]["identifiable"],
-            ATTR_DYNAMICS_BOUNDARY_LIMITED: timescales["characteristic"]["boundary_limited"],
-        })
-        if self._last_update_diag is not None:
-            d = self._last_update_diag
-            if self._last_source is not None:
-                attrs[ATTR_LAST_SOURCE] = self._last_source
-            attrs.update({
-                ATTR_MEASUREMENT_SIGMA: round(d["measurement_sigma"], 10),
-                ATTR_MEASUREMENT_VARIANCE: round(d["measurement_variance"], 10),
-                ATTR_INNOVATION: round(d["innovation"], 10),
-                ATTR_Z_SCORE: round(d["z_score"], 4),
-                ATTR_ROBUST_WEIGHT: round(d["robust_weight"], 6),
-                ATTR_UPDATE_DT: round(d["update_dt_s"], 3),
-            })
-        if "bias_anchor_models" in calibration:
-            attrs["bias_anchor_models"] = calibration["bias_anchor_models"]
+            full_last_update = None
+            if self._last_update_diag is not None:
+                d = self._last_update_diag
+                full_last_update = {
+                    "source": self._last_source,
+                    "measurement_sigma": round(d["measurement_sigma"], 10),
+                    "measurement_variance": round(d["measurement_variance"], 10),
+                    "innovation": round(d["innovation"], 10),
+                    "innovation_z": round(d["z_score"], 4),
+                    "robust_weight": round(d["robust_weight"], 6),
+                    "innovation_used": round(d["innovation_used"], 10),
+                    "innovation_clipped": bool(d["innovation_clipped"]),
+                    "clip_sigma": d["clip_sigma"],
+                    "update_dt_s": round(d["update_dt_s"], 3),
+                    "innovation_variance": round(d["innovation_var"], 10),
+                    "effective_innovation_variance": round(
+                        d["effective_innovation_variance"], 10
+                    ),
+                    "p_value": round(d["p_value"], 8),
+                    "noise_velocity": round(d["noise_velocity"], 10),
+                }
 
-        if self._diagnostics_full:
-            # Exact 2.1-era laboratory diagnostics.  Kept behind an explicit
-            # switch so existing investigations remain possible without
-            # overwhelming normal entity attributes.
-            attrs.update({
-                ATTR_VARIANCE: round(var, 10),
-                ATTR_VELOCITY: round(velocity, 10),
-                ATTR_VELOCITY_TIME: round(self.filter.tau, 3),
-                ATTR_PROCESS_NOISE: f"{self.filter.q_process:.6e}",
-            })
+            debug = {
+                "variance": round(var, 10),
+                "noise": {
+                    "mode_config": self._noise_mode_cfg,
+                    "model": self._noise_model_name,
+                    "params": self._noise_model_params(),
+                },
+                "calibration": calibration,
+                "dynamics": derivative_debug,
+                "timescales": timescales,
+                "startup": {
+                    "mode": self._startup_mode,
+                    "checkpoint_store_key": self._store_key,
+                    "hidden_recorder_replayed": int(self._startup_sync_replayed),
+                    "hidden_current_replayed": int(self._startup_sync_current),
+                    "hidden_sync_gap_s": round(float(self._startup_sync_gap_s), 3),
+                },
+                "fallback": {
+                    "active": bool(self._fallback_active),
+                    "reason": self._fallback_reason,
+                    "level_z": (
+                        round(float(self._fallback_last_z), 4)
+                        if math.isfinite(float(self._fallback_last_z)) else None
+                    ),
+                    "enter_z": self._fallback_enter_z,
+                    "exit_z": self._fallback_exit_z,
+                    "exit_confirmations": self._fallback_exit_confirmations,
+                    "safe_count": int(self._fallback_safe_count),
+                    "entries": int(self._fallback_entries),
+                    "observed_level": (
+                        round(float(self._fallback_value), 10)
+                        if self._fallback_value is not None else None
+                    ),
+                    "last_event": self._fallback_last_event,
+                },
+                "source_health": health,
+                "regime_change": {
+                    "z_threshold": self._regime_change_z_threshold,
+                    "confirmations_required": self._regime_change_confirmations,
+                    "startup_guard_remaining": int(self._regime_startup_guard_remaining),
+                    "startup_reanchors": int(self._regime_startup_reanchors),
+                    "candidate_count": int(self._regime_candidate_count),
+                    "candidate_direction": (
+                        "up" if self._regime_candidate_sign > 0
+                        else "down" if self._regime_candidate_sign < 0
+                        else None
+                    ),
+                    "candidate_peak_z": round(float(self._regime_candidate_peak_z), 4),
+                    "last_event": self._last_regime_change,
+                },
+                "last_update": full_last_update,
+            }
 
             if self._characteristic is not None:
                 c = self._characteristic
-                attrs.update({
-                    ATTR_DYNAMICS_EDGE_MASS: round(c.edge_mass, 4),
-                    ATTR_CHARACTERISTIC_NUGGET_VARIANCE: round(c.nugget_variance, 10),
-                    ATTR_CHARACTERISTIC_PROCESS_VARIANCE: round(c.process_variance, 10),
-                    ATTR_CHARACTERISTIC_SIGNAL_FRACTION: round(c.signal_fraction, 4),
-                    ATTR_CHARACTERISTIC_FIT_ERROR: round(c.fit_error, 4),
-                    ATTR_CHARACTERISTIC_LAG_COUNT: int(c.lag_count),
-                    ATTR_CHARACTERISTIC_PAIR_COUNT: int(c.pair_count),
-                    ATTR_CHARACTERISTIC_MIN_LAG: round(c.min_lag, 3),
-                    ATTR_CHARACTERISTIC_MAX_LAG: round(c.max_lag, 3),
-                })
-
-            if self._last_update_diag is not None:
-                d = self._last_update_diag
-                attrs.update({
-                    ATTR_NOISE_VELOCITY: round(d["noise_velocity"], 10),
-                    ATTR_INNOVATION_VAR: round(d["innovation_var"], 10),
-                    ATTR_P_VALUE: round(d["p_value"], 8),
-                    ATTR_EFFECTIVE_INNOVATION_VARIANCE: round(
-                        d["effective_innovation_variance"], 10
-                    ),
-                })
+                debug["characteristic_fit"] = {
+                    "edge_mass": round(c.edge_mass, 4),
+                    "nugget_variance": round(c.nugget_variance, 10),
+                    "process_variance": round(c.process_variance, 10),
+                    "signal_fraction": round(c.signal_fraction, 4),
+                    "fit_error": round(c.fit_error, 4),
+                    "lag_count": int(c.lag_count),
+                    "pair_count": int(c.pair_count),
+                    "min_lag_s": round(c.min_lag, 3),
+                    "max_lag_s": round(c.max_lag, 3),
+                }
+            attrs["debug"] = debug
 
         self._attrs = attrs
 
     def _mode_name(self):
-        # The level/state estimate can be healthy even when the experimental
-        # predictive velocity-memory hyperparameter is not identifiable.  Do
-        # not label the whole filter as "learning" merely because velocity_tau
-        # is boundary-limited.
+        # Publication mode is intentionally distinct from latent filter mode.
+        # In raw_fallback the Bayesian state keeps updating internally while HA
+        # receives the direct untransported observation until agreement returns.
         if self.filter.t_last is None:
             return "warmup"
+        if self._fallback_active:
+            return "raw_fallback"
+        try:
+            if hasattr(self.filter.state_model, "effective_weights"):
+                weights = self.filter.state_model.effective_weights(
+                    self.filter.x, self.filter.P, max(float(self._level_grid_step), 1e-6)
+                )
+                if len(weights) > 1 and float(np.min(weights[1:])) <= self._fallback_derivative_weight_threshold:
+                    return "degraded"
+        except Exception:
+            pass
         return "tracking"
 
     def _source_health(self):
@@ -1789,27 +2477,83 @@ class BayesianEnsembleSensor(SensorEntity):
             self._attr_icon = st.attributes.get("icon")
 
     def _apply_noise_model(self):
-        """Apply configured or history-detected observation-noise family."""
+        """Apply stochastic-family diagnostics and runtime variance shape.
+
+        Runtime source variance uses one continuous family:
+
+            R(x) = R_ref * ((1-p) + p * |x| / x_ref)
+
+        where R_ref is the existing per-source calibrated sigma^2.  Gaussian
+        and scaled-Poisson are therefore just p=0 and p=1.  A statistically
+        supported local variance law may choose an intermediate p without
+        changing the learned source-noise scale.
+        """
         mode = self._noise_mode_cfg
         if mode == "auto":
             family = self._noise_detection.family
         else:
             family = mode
 
+        runtime_p = 0.0
+        runtime_source = "constant"
+
+        if mode == "poisson":
+            runtime_p = 1.0
+            runtime_source = "explicit_poisson"
+        elif mode == "gaussian":
+            runtime_p = 0.0
+            runtime_source = "explicit_gaussian"
+        elif family == "poisson":
+            # Stationary scaled-Poisson evidence is informative even when the
+            # signal has too little independent level span for the local law.
+            runtime_p = 1.0
+            runtime_source = self._noise_detection.reason or "poisson_detection"
+        else:
+            lv_reason = self._noise_detection.level_variance_reason
+            lv_conf = float(self._noise_detection.level_variance_confidence or 0.0)
+            lv_fraction = self._noise_detection.level_variance_fraction
+            if (
+                lv_reason == "level_dependent_local_residuals"
+                and lv_fraction is not None
+                and lv_conf >= 0.55
+            ):
+                runtime_p = max(0.0, min(1.0, float(lv_fraction)))
+                runtime_source = "local_variance_law"
+
+        self._runtime_level_fraction = float(runtime_p)
+        self._runtime_variance_source = runtime_source
+        self._runtime_noise_mode = (
+            "poisson" if runtime_p >= 1.0 - 1e-12 else
+            "gaussian" if runtime_p <= 1e-12 else
+            "mixed"
+        )
+
+        # CoreFilter normally receives explicit fused observation variance, so
+        # this object is principally the fallback/p-value model.  Both current
+        # implementations use the same Gaussian-tail p-value calculation.
         if family == "poisson":
             k = self._noise_detection.poisson_scale
             if k is not None and math.isfinite(float(k)) and float(k) > 0:
                 self._poisson_noise.set_scale(float(k))
             self.filter.noise_model = self._poisson_noise
-            self._noise_model_name = "poisson"
-            return "poisson"
+        else:
+            self.filter.noise_model = self._gaussian_noise
 
-        # Quantization is an independent observation property.  It is already
-        # present in the empirically learned source sigma, so q^2/12 is not
-        # added again here.
-        self.filter.noise_model = self._gaussian_noise
-        self._noise_model_name = "gaussian"
-        return "gaussian"
+        # Public noise_model describes the observation-noise law actually used
+        # by runtime, not merely the legacy binary detector family.  A local
+        # level-dependent fit is reported as gaussian+poisson even when its
+        # constrained best fit lands on p=1: boundary-limited p=1 is not proof
+        # of a pure Poisson mechanism.
+        if mode == "poisson" or (mode == "auto" and family == "poisson"):
+            self._noise_model_name = "poisson"
+        elif mode == "gaussian":
+            self._noise_model_name = "gaussian"
+        elif runtime_source == "local_variance_law":
+            self._noise_model_name = "gaussian+poisson"
+        else:
+            self._noise_model_name = "gaussian"
+
+        return self._runtime_noise_mode
 
     @property
     def native_value(self):

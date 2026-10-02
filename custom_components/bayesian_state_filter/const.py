@@ -61,6 +61,12 @@ FRESHNESS_TAU_FRACTION = 0.20
 FRESHNESS_MIN_S = 300.0
 CHARACTERISTIC_REFIT_MIN_S = 300.0
 
+# Shared phase/regime-change semantics.  Live recovery and historical
+# derivative training must agree on what constitutes a discrete level jump.
+REGIME_CHANGE_Z_THRESHOLD = 6.0
+REGIME_CHANGE_CONFIRMATIONS = 3
+REGIME_CHANGE_COMPACT_SIGMA = 3.0
+
 
 # v0.3 full [x,v,a,j] posterior diagnostics. Derivative values are exposed in
 # human-scale per-hour units while the internal state remains per-second.

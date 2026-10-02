@@ -9,6 +9,10 @@ from .process_noise import IntegratedWienerProcessNoise
 from .state_models import AdaptivePolynomialStateModel
 from .types import Observation
 from .updaters import StudentTUpdater
+from ..const import (
+    REGIME_CHANGE_Z_THRESHOLD, REGIME_CHANGE_CONFIRMATIONS,
+    REGIME_CHANGE_COMPACT_SIGMA,
+)
 
 _FULL_ORDER = 3
 _Q00_DENOM = (2 * _FULL_ORDER + 1) * (math.factorial(_FULL_ORDER) ** 2)  # 252
@@ -32,6 +36,13 @@ class GatedDynamicsEstimate:
     validation_points: int
     search_boundary_limited: bool
     search_rounds: int
+    # Robust local-polynomial derivative distribution learned from the same
+    # history. Index 0 is level (unused by gating); 1/2/3 are v/a/j.
+    derivative_centers: list[float] | None = None
+    derivative_scales: list[float] | None = None
+    derivative_samples: list[int] | None = None
+    derivative_means: list[float] | None = None
+    derivative_training_diagnostics: dict | None = None
 
     def dump(self) -> dict:
         return self.__dict__.copy()
@@ -77,9 +88,14 @@ def q_from_timescale(order: int, measurement_variance: float, timescale_s: float
     return math.exp(logq)
 
 
-def _make_filter(q: float, level_q: float, prior_timescale_s: float, nu: float, sigma: float) -> CoreFilter:
+def _make_filter(q: float, level_q: float, prior_timescale_s: float, nu: float, sigma: float,
+                 derivative_profile=None) -> CoreFilter:
+    model = AdaptivePolynomialStateModel(_FULL_ORDER)
+    if derivative_profile is not None:
+        centers, scales, samples = derivative_profile
+        model.set_derivative_plausibility(scales=scales, centers=centers, samples=samples)
     return CoreFilter(
-        state_model=AdaptivePolynomialStateModel(_FULL_ORDER),
+        state_model=model,
         noise_model=None,
         updater=StudentTUpdater(nu=nu, min_weight=0.05),
         process_noise=IntegratedWienerProcessNoise(_FULL_ORDER, q, level_q=level_q),
@@ -132,6 +148,199 @@ def _representative_points(points, max_points: int = 6000, blocks: int = 6):
     return out
 
 
+def _historical_regime_boundaries(points, *, z_threshold: float = REGIME_CHANGE_Z_THRESHOLD,
+                                  confirmations: int = REGIME_CHANGE_CONFIRMATIONS,
+                                  compact_sigma: float = REGIME_CHANGE_COMPACT_SIGMA):
+    """Locate discrete level-regime boundaries in historical observations.
+
+    This mirrors the live ``regime_change`` semantics as closely as possible
+    without using the posterior filter state: a candidate must be a large
+    (>= z_threshold) same-direction departure from the immediately preceding
+    plateau, survive ``confirmations`` samples, and settle compactly around a
+    new level.  The returned indices point at the *first* sample of the new
+    plateau.  Local derivative windows crossing such an index must not be used
+    to teach v/a/j plausibility: a level step is not a huge derivative.
+    """
+    n = len(points)
+    if n < confirmations + 4:
+        return set(), {"detected_level_jumps": 0}
+
+    dt0 = max(_median_dt(points), 1e-9)
+    # A short robust preceding plateau.  Long enough to suppress sample noise,
+    # short enough not to smear normal slow dynamics into a false jump.
+    pre_n = max(5, int(confirmations) + 2)
+    boundaries = set()
+    cooldown_until = -math.inf
+
+    i = pre_n
+    while i + confirmations <= n:
+        t0 = float(points[i][0])
+        if t0 < cooldown_until:
+            i += 1
+            continue
+
+        pre = points[i - pre_n:i]
+        new = points[i:i + confirmations]
+        times = np.asarray([float(p[0]) for p in pre + new], dtype=float)
+        if not np.all(np.isfinite(times)):
+            i += 1
+            continue
+        gaps = np.diff(times)
+        if gaps.size and (np.any(gaps <= 0.0) or np.max(gaps) > 4.0 * dt0):
+            i += 1
+            continue
+
+        pre_vals = np.asarray([float(p[1]) for p in pre], dtype=float)
+        new_vals = np.asarray([float(p[1]) for p in new], dtype=float)
+        pre_sig = np.asarray([max(float(p[2]), 1e-12) for p in pre], dtype=float)
+        new_sig = np.asarray([max(float(p[2]), 1e-12) for p in new], dtype=float)
+        if not (np.all(np.isfinite(pre_vals)) and np.all(np.isfinite(new_vals))):
+            i += 1
+            continue
+
+        old_level = float(np.median(pre_vals))
+        target = float(np.median(new_vals))
+        innovation = target - old_level
+        if innovation == 0.0:
+            i += 1
+            continue
+        sign = 1.0 if innovation > 0.0 else -1.0
+
+        # Include both stated measurement sigma and the robust width of the old
+        # plateau.  This avoids calling quantisation/noise a phase transition.
+        pre_mad_sigma = 1.4826 * float(np.median(np.abs(pre_vals - old_level)))
+        sigma_old = max(float(np.median(pre_sig)), pre_mad_sigma, 1e-12)
+        sigma_new = max(float(np.median(new_sig)), 1e-12)
+        innovation_sigma = math.sqrt(sigma_old * sigma_old + sigma_new * sigma_new)
+        z = abs(innovation) / innovation_sigma
+        if (not math.isfinite(z)) or z < float(z_threshold):
+            i += 1
+            continue
+
+        # Same-direction confirmation: every point in the confirmation window
+        # must remain clearly on the new side of the old plateau.
+        deviations = new_vals - old_level
+        same_direction = bool(np.all(sign * deviations > 0.0))
+        if not same_direction:
+            i += 1
+            continue
+
+        target_sigma = max(float(np.median(new_sig)), 1e-12)
+        compact_limit = float(compact_sigma) * target_sigma
+        compact = float(np.max(np.abs(new_vals - target))) <= compact_limit
+        if not compact:
+            i += 1
+            continue
+
+        boundaries.add(i)
+        cooldown_until = float(new[-1][0]) + max(30.0, 4.0 * dt0)
+        i += confirmations
+
+    return boundaries, {"detected_level_jumps": int(len(boundaries))}
+
+
+def _estimate_derivative_profile(points, *, max_fits: int = 8000, half_window: int = 4,
+                                 regime_z_threshold: float = REGIME_CHANGE_Z_THRESHOLD,
+                                 regime_confirmations: int = REGIME_CHANGE_CONFIRMATIONS,
+                                 regime_compact_sigma: float = REGIME_CHANGE_COMPACT_SIGMA):
+    """Estimate robust v/a/j scales from smooth parts of the training trajectory.
+
+    A centred local cubic is fitted directly to the fused history using the
+    basis [1, dt, dt^2/2, dt^3/6], so the fitted coefficients are level,
+    velocity, acceleration and jerk in native SI time units.  Windows crossing
+    a confirmed historical level-regime transition are excluded: a physical
+    step must not inflate the derivative distribution.
+
+    The published centre is the sample median; the arithmetic mean is retained
+    as a diagnostic so we can verify that, after removing phase transitions,
+    derivative expectation collapses towards zero.  The production gate itself
+    remains centred at zero and uses the larger of ordinary MAD around the
+    median and a zero-centred robust scale 1.4826*median(|d|).
+    """
+    n = len(points)
+    centers = [0.0] * (_FULL_ORDER + 1)
+    means = [0.0] * (_FULL_ORDER + 1)
+    scales = [float("nan")] * (_FULL_ORDER + 1)
+    samples = [0] * (_FULL_ORDER + 1)
+    diagnostics = {
+        "candidate_windows": 0,
+        "accepted_windows": 0,
+        "rejected_gap_windows": 0,
+        "rejected_regime_crossing_windows": 0,
+        "detected_level_jumps": 0,
+    }
+    if n < 2 * half_window + 1:
+        return centers, scales, samples, means, diagnostics
+
+    dt0 = max(_median_dt(points), 1e-9)
+    boundaries, regime_diag = _historical_regime_boundaries(
+        points,
+        z_threshold=regime_z_threshold,
+        confirmations=regime_confirmations,
+        compact_sigma=regime_compact_sigma,
+    )
+    diagnostics.update(regime_diag)
+
+    valid = np.arange(half_window, n - half_window, dtype=int)
+    if valid.size > max_fits:
+        pick = np.linspace(0, valid.size - 1, max_fits, dtype=int)
+        valid = valid[pick]
+
+    collected = [[] for _ in range(_FULL_ORDER + 1)]
+    for i in valid:
+        diagnostics["candidate_windows"] += 1
+        lo = int(i - half_window)
+        hi = int(i + half_window)
+        # A boundary b means sample b is the first point of the new regime.
+        # Reject whenever the local polynomial sees points on both sides.
+        if any(lo < b <= hi for b in boundaries):
+            diagnostics["rejected_regime_crossing_windows"] += 1
+            continue
+
+        window = points[lo:hi + 1]
+        tt = np.asarray([float(p[0]) for p in window], dtype=float)
+        zz = np.asarray([float(p[1]) for p in window], dtype=float)
+        if not np.all(np.isfinite(tt)) or not np.all(np.isfinite(zz)):
+            continue
+        gaps = np.diff(tt)
+        if gaps.size and (np.any(gaps <= 0.0) or np.max(gaps) > 4.0 * dt0):
+            diagnostics["rejected_gap_windows"] += 1
+            continue
+        u = tt - float(points[i][0])
+        A = np.column_stack((
+            np.ones_like(u),
+            u,
+            0.5 * u * u,
+            (u * u * u) / 6.0,
+        ))
+        try:
+            beta, *_ = np.linalg.lstsq(A, zz, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+        if beta.size != _FULL_ORDER + 1 or not np.all(np.isfinite(beta)):
+            continue
+        diagnostics["accepted_windows"] += 1
+        for order in range(1, _FULL_ORDER + 1):
+            collected[order].append(float(beta[order]))
+
+    for order in range(1, _FULL_ORDER + 1):
+        arr = np.asarray(collected[order], dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        center = float(np.median(arr))
+        mean = float(np.mean(arr))
+        sigma_mad = 1.4826 * float(np.median(np.abs(arr - center)))
+        sigma_zero = 1.4826 * float(np.median(np.abs(arr)))
+        scale = max(sigma_mad, sigma_zero, 0.0)
+        centers[order] = center
+        means[order] = mean
+        scales[order] = scale
+        samples[order] = int(arr.size)
+
+    return centers, scales, samples, means, diagnostics
+
+
 def _student_score(err: float, variance: float, nu: float) -> float:
     """Robust proper-ish predictive score; lower is better."""
     v = max(float(variance), 1e-18)
@@ -141,12 +350,12 @@ def _student_score(err: float, variance: float, nu: float) -> float:
 
 
 def _evaluate(points, q: float, level_q: float, prior_T: float, nu: float,
-              *, max_forecasts: int = 1000):
+              *, max_forecasts: int = 1000, derivative_profile=None):
     if len(points) < 8:
         return math.inf, {}, -math.inf, math.inf
     sigmas = [max(float(p[2]), 1e-12) for p in points]
     sigma0 = float(np.median(sigmas)) if sigmas else 1.0
-    f = _make_filter(q, level_q, prior_T, nu, sigma0)
+    f = _make_filter(q, level_q, prior_T, nu, sigma0, derivative_profile=derivative_profile)
     dt0 = max(_median_dt(points), 1e-6)
     gap_reset = 8.0 * dt0
     warmup = min(max(16, int(len(points) * 0.03)), max(len(points) - 3, 0))
@@ -236,7 +445,7 @@ def _crossover_timescale(q: float, level_q: float, R: float, dt: float, max_h: f
     return hi, False
 
 
-def fit_process_noise(train_points, nu: float):
+def fit_process_noise(train_points, nu: float, derivative_profile=None):
     if len(train_points) < 8:
         sigma = float(train_points[0][2]) if train_points else 1.0
         R = sigma * sigma
@@ -255,7 +464,9 @@ def fit_process_noise(train_points, nu: float):
     best_idx = None
     for li, level_q in enumerate(level_candidates):
         for qi, q in enumerate(snap_candidates):
-            score, _errors, _ll, _se = _evaluate(points, q, level_q, prior_T, nu)
+            score, _errors, _ll, _se = _evaluate(
+                points, q, level_q, prior_T, nu, derivative_profile=derivative_profile
+            )
             cand = (score, float(q), float(level_q))
             if best is None or cand[0] < best[0]:
                 best = cand
@@ -270,7 +481,10 @@ def fit_process_noise(train_points, nu: float):
     # Keep the historical diagnostic name ``train_rmse`` meaningful even
     # though candidate selection itself uses the multi-horizon predictive
     # score above.
-    _s, errors, _ll, _se = _evaluate(points, q, level_q, prior_T, nu, max_forecasts=1200)
+    _s, errors, _ll, _se = _evaluate(
+        points, q, level_q, prior_T, nu, max_forecasts=1200,
+        derivative_profile=derivative_profile,
+    )
     rmses = [_rmse(errors.get(h, [])) for h in _HORIZON_STEPS]
     finite = [x for x in rmses if math.isfinite(x)]
     train_rmse = float(math.sqrt(np.mean(np.square(finite)))) if finite else math.inf
@@ -294,11 +508,18 @@ def train_gated_dynamics(fused_points, nu: float = 4.0, train_fraction: float = 
     train = points[:split]
     validation = points[split:]
 
-    q, level_q, Tdiag, train_score, boundary, rounds = fit_process_noise(train, nu)
+    derivative_profile_full = _estimate_derivative_profile(points)
+    derivative_profile = derivative_profile_full[:3]
+    q, level_q, Tdiag, train_score, boundary, rounds = fit_process_noise(
+        train, nu, derivative_profile=derivative_profile
+    )
     dt = max(_median_dt(train), 1e-6)
     prior_T = max(16.0 * dt, 60.0)
     val_points = _representative_points(validation, max_points=6000, blocks=6)
-    _score, errors, ll_mean, ll_se = _evaluate(val_points, q, level_q, prior_T, nu, max_forecasts=1200)
+    _score, errors, ll_mean, ll_se = _evaluate(
+        val_points, q, level_q, prior_T, nu, max_forecasts=1200,
+        derivative_profile=derivative_profile,
+    )
     rmse1 = _rmse(errors.get(1, []))
     rmse2 = _rmse(errors.get(2, []))
     per_h_rmse = [_rmse(errors.get(h, [])) for h in _HORIZON_STEPS]
@@ -323,4 +544,9 @@ def train_gated_dynamics(fused_points, nu: float = 4.0, train_fraction: float = 
         validation_points=len(validation),
         search_boundary_limited=bool(boundary),
         search_rounds=int(rounds),
+        derivative_centers=list(derivative_profile[0]),
+        derivative_scales=list(derivative_profile[1]),
+        derivative_samples=list(derivative_profile_full[2]),
+        derivative_means=list(derivative_profile_full[3]),
+        derivative_training_diagnostics=dict(derivative_profile_full[4]),
     )

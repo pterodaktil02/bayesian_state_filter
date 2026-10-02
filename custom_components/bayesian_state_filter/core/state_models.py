@@ -44,38 +44,84 @@ class PolynomialStateModel:
 
 
 class AdaptivePolynomialStateModel(PolynomialStateModel):
-    """Full [x, v, a, j] state with posterior-confidence derivative gating.
+    """Full [x, v, a, j] state with history-trained plausibility gating.
 
-    The model order never changes.  For each derivative we derive confidence
-    directly from its Gaussian posterior significance ``z=|d|/sigma_d``::
+    Derivative *confidence* and derivative *plausibility* are intentionally
+    different quantities:
 
-        c(z) = 2*Phi(z) - 1 = erf(z / sqrt(2))
+    - ``confidence_weights`` reports posterior significance
+      ``erf(|d| / sigma_posterior / sqrt(2))`` for diagnostics only;
+    - ``effective_weights`` controls kinematic transport/prediction. Local
+      derivative plausibility falls as magnitude becomes unusual relative to
+      the robust history scale, while effective higher-order weights inherit
+      every lower-order penalty.
 
-    No gate threshold is trained. Confidence remains a probabilistic
-    statement about the derivative estimate. Higher-order derivatives are
-    deliberately gated more strongly by an exponential decay in confidence
-    deficit::
+    For derivative order k the production gate is
 
-        g_k(c) = exp(-k * (1-c) / c)
+        w_k = exp(-0.5 * (|d_k| / sigma_hist,k)^2),  |d_k| < 5 sigma_hist,k
+        w_k = 0,                                     otherwise
 
-    Coupling is hierarchical along the kinematic chain::
-
-        w_v = g_1(c_v)
-        w_a = w_v * g_2(c_a)
-        w_j = w_a * g_3(c_j)
-
-    Hence 1 >= w_v >= w_a >= w_j >= 0 while all four state components remain
-    estimated at all times.
+    ``sigma_hist`` is a Gaussian-consistent robust scale, 1.4826*MAD, learned
+    from local-polynomial derivatives of the training history.  The gate is
+    centred at zero on purpose: a small derivative is useful evidence that the
+    process is quiet and therefore receives maximum weight.
     """
+
+    PLAUSIBILITY_CUTOFF_SIGMA = 5.0
 
     def __init__(self, order: int):
         super().__init__(order)
+        self._derivative_centers = np.zeros(self.dim_x(), dtype=float)
+        self._derivative_scales = np.full(self.dim_x(), np.nan, dtype=float)
+        self._derivative_samples = np.zeros(self.dim_x(), dtype=int)
+
+    def set_derivative_plausibility(self, scales=None, centers=None, samples=None):
+        """Install history-trained robust derivative scales.
+
+        ``centers`` are retained for diagnostics only.  The production gate is
+        deliberately centred at zero, not at the historical median derivative.
+        """
+        n = self.dim_x()
+        out_scales = np.full(n, np.nan, dtype=float)
+        out_centers = np.zeros(n, dtype=float)
+        out_samples = np.zeros(n, dtype=int)
+        if scales is not None:
+            for i, value in enumerate(list(scales)[:n]):
+                try:
+                    value = float(value)
+                    if math.isfinite(value) and value >= 0.0:
+                        out_scales[i] = value
+                except (TypeError, ValueError):
+                    pass
+        if centers is not None:
+            for i, value in enumerate(list(centers)[:n]):
+                try:
+                    value = float(value)
+                    if math.isfinite(value):
+                        out_centers[i] = value
+                except (TypeError, ValueError):
+                    pass
+        if samples is not None:
+            for i, value in enumerate(list(samples)[:n]):
+                try:
+                    out_samples[i] = max(int(value), 0)
+                except (TypeError, ValueError):
+                    pass
+        self._derivative_scales = out_scales
+        self._derivative_centers = out_centers
+        self._derivative_samples = out_samples
+
+    def derivative_plausibility_parameters(self):
+        return {
+            "law": "gaussian_abs_derivative_over_robust_sigma",
+            "cutoff_sigma": float(self.PLAUSIBILITY_CUTOFF_SIGMA),
+            "centers": self._derivative_centers.tolist(),
+            "scales": self._derivative_scales.tolist(),
+            "samples": self._derivative_samples.tolist(),
+        }
 
     def gate_parameters(self):
-        return {
-            "law": "erf_abs_z_over_sqrt2",
-            "hierarchy": "exponential_confidence_deficit",
-        }
+        return self.derivative_plausibility_parameters()
 
     @staticmethod
     def significance(value: float, variance: float) -> float:
@@ -83,6 +129,7 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         return abs(float(value)) / sigma
 
     def confidence_weight(self, value: float, variance: float, derivative_order: int = 1) -> float:
+        """Posterior non-zero significance retained for diagnostics only."""
         z = self.significance(value, variance)
         if not math.isfinite(z):
             return 1.0 if z > 0 else 0.0
@@ -90,53 +137,59 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
             return 0.0
         return float(min(1.0, max(0.0, math.erf(z / math.sqrt(2.0)))))
 
-    def derivative_weight(self, x, P, derivative_order: int, dt: float | None = None) -> float:
-        j = int(derivative_order)
-        if j <= 0 or j >= self.dim_x():
+    def plausibility_weight(self, value: float, derivative_order: int) -> float:
+        order = int(derivative_order)
+        if order <= 0 or order >= self.dim_x():
             return 1.0
-        return self.confidence_weight(x[j], P[j, j], j)
+        scale = float(self._derivative_scales[order])
+        value = abs(float(value))
+
+        # No trained scale yet: do not recreate the old positive-feedback gate.
+        # A missing model means neutral coupling until history training supplies
+        # a process-specific scale.
+        if not math.isfinite(scale):
+            return 1.0
+        if scale <= 0.0:
+            return 1.0 if value <= 1e-15 else 0.0
+
+        z = value / scale
+        if not math.isfinite(z) or z >= self.PLAUSIBILITY_CUTOFF_SIGMA:
+            return 0.0
+        return float(math.exp(-0.5 * z * z))
+
+    def derivative_weight(self, x, P, derivative_order: int, dt: float | None = None) -> float:
+        order = int(derivative_order)
+        if order <= 0 or order >= self.dim_x():
+            return 1.0
+        return self.plausibility_weight(x[order], order)
 
     def confidence_weights(self, x, P):
-        """Independent posterior confidence for each derivative order."""
+        """Independent posterior significance for each derivative order."""
         c = np.ones(self.dim_x(), dtype=float)
         for order in range(1, self.dim_x()):
-            c[order] = self.derivative_weight(x, P, order)
+            c[order] = self.confidence_weight(x[order], P[order, order], order)
         return c
 
-    @staticmethod
-    def _order_gate(confidence: float, order: int) -> float:
-        """Exponentially suppress weak derivative evidence.
-
-        ``confidence`` is already a posterior probability-like quantity in
-        [0, 1].  The transform is exactly zero at c=0, exactly one at c=1 and
-        decays increasingly aggressively with derivative order without adding
-        a hard threshold.
-        """
-        c = min(1.0, max(0.0, float(confidence)))
-        if c <= 0.0:
-            return 0.0
-        if c >= 1.0:
-            return 1.0
-        return float(math.exp(-float(order) * (1.0 - c) / c))
-
     def effective_weights(self, x, P, dt: float):
-        """Hierarchical coupling weights for the derivative chain.
+        """Hierarchical history-plausibility weights for v/a/j coupling.
 
-        Each derivative contributes an order-dependent exponential gate:
+        Each derivative has its own Gaussian plausibility gate, but higher
+        orders inherit every lower-order penalty:
 
-            g_k(c) = exp(-k * (1-c) / c)
+            W_v = w_v
+            W_a = w_v * w_a
+            W_j = w_v * w_a * w_j
 
-        and the kinematic hierarchy remains cumulative:
-
-            w_v = g_1(c_v)
-            w_a = w_v * g_2(c_a)
-            w_j = w_a * g_3(c_j)
+        This makes the state model degrade monotonically toward a lower-order
+        model as its dynamics become implausible: x-v-a-j -> x-v-a -> x-v -> x.
+        Small derivatives are not suppressed: d=0 has local weight 1.  Any
+        local five-sigma rejection also disables all higher derivatives.
         """
-        c = self.confidence_weights(x, P)
         w = np.ones(self.dim_x(), dtype=float)
         cumulative = 1.0
         for order in range(1, self.dim_x()):
-            cumulative *= self._order_gate(c[order], order)
+            local = self.plausibility_weight(x[order], order)
+            cumulative *= local
             w[order] = cumulative
         return w
 
@@ -144,21 +197,15 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         F = self.transition(dt)
         Fw = F.copy()
         weights = self.effective_weights(x, P, dt)
-        # Keep diagonal persistence untouched; gate only the way a higher
-        # derivative bends lower-order states over this local step.
         for j in range(1, self.dim_x()):
             for i in range(j):
                 Fw[i, j] *= weights[j]
         return Fw, weights
 
     def predict(self, x, P, dt, Q):
-        # Confidence gating controls only how strongly currently supported
-        # derivatives bend the *mean* trajectory.  Covariance must still use
-        # the full kinematic transition so level observations can create and
-        # update x-v-a-j cross-covariances even when derivative means start at
-        # zero and their mean gates are closed.  Otherwise w=0 becomes an
-        # absorbing x-only state from which the hidden derivatives can never
-        # become observable.
+        # Plausibility gating controls only how strongly derivatives bend the
+        # mean trajectory. Covariance continues to use the full kinematic
+        # transition so hidden derivatives remain observable from level data.
         F = self.transition(dt)
         Fw = F.copy()
         weights = self.effective_weights(x, P, dt)
