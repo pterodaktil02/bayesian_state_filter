@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.0-dev.10 - 2026-10-02
+
+### Dynamics plausibility
+- Replaced posterior-significance derivative gating with history-trained plausibility gating.
+- Learned robust derivative scales from Recorder history using `1.4826 * MAD` of local-polynomial `v/a/j` estimates.
+- Centred the production gate at zero so a quiet derivative receives maximum weight instead of being treated as uninformative.
+- Applied Gaussian decay `exp(-z^2/2)` with a hard zero at 5 robust sigma.
+- Made derivative influence hierarchical: `W_v = w_v`, `W_a = w_v*w_a`, `W_j = w_v*w_a*w_j`, yielding automatic degradation `x-v-a-j -> x-v-a -> x-v -> x`.
+- Preserved posterior derivative z-scores as diagnostics only; they no longer authorize unrestricted kinematic extrapolation.
+- Preserved independent level diffusion when derivative coupling is suppressed.
+
+### Regime changes
+- Reused the live 6-sigma / 3-confirmation / compact-plateau regime-change semantics during historical dynamics training.
+- Excluded local-polynomial training windows that cross confirmed level jumps, so discrete actuator transitions are not learned as extreme velocity, acceleration or jerk.
+- Added derivative-distribution sanity diagnostics including mean-over-robust-sigma.
+
+### Restart continuity
+- Added hidden Recorder catch-up before the first entity publication after restart.
+- Added a final current-source synchronization step after Recorder replay to cover observations not yet persisted.
+- Restart gaps now affect latent uncertainty/state internally instead of publishing a synthetic startup discontinuity.
+
+### Safety fallback
+- Added direct raw/fused publication fallback when the Bayesian level diverges strongly from current observation while dynamics are implausible or a regime change is developing.
+- The latent Bayesian filter continues updating while fallback is active and resumes publication only after stable reconvergence.
+- Fallback uses a direct snapshot that does not depend on derivative transport, preventing runaway state from contaminating the safety reference.
+
+### Diagnostics
+- Reworked public attributes into compact `minimal`, `normal` and `debug` levels.
+- Removed duplicate flat/grouped attributes from normal output.
+- Added `rate_mean_over_sigma`, `curvature_mean_over_sigma` and `jerk_mean_over_sigma`.
+- Moved calibration internals, posterior derivative uncertainty, full source health, startup details and noise-model internals to debug diagnostics.
+- Kept legacy `compact/full/verbose` diagnostic names as compatibility aliases.
+
+### Fixes
+- Prevented large but overconfident hidden derivatives from self-reinforcing through stale-source transport.
+- Prevented startup replay/re-anchor behavior from creating visible post-restart level jumps.
+- Added an observation-level safety path so the published entity cannot remain catastrophically worse than direct sensor evidence.
+
 ## 0.4.1 - 2026-09-27
 
 ### Multi-source fusion
