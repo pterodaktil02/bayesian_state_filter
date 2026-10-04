@@ -1,6 +1,6 @@
 # Bayesian State Filter for Home Assistant
 
-Version: **0.5.0-dev.10**
+Version: **0.5.0-dev.38**
 
 [Русское описание](README.md)
 
@@ -33,30 +33,45 @@ where `x` is level, `v` is rate, `a` is acceleration and `j` is jerk.
 
 The model uses an integrated Wiener process. Confidence gating is applied to the mean prediction, while covariance is propagated through the full kinematic transition. This prevents weakly supported derivatives from driving the mean while preserving their observability through cross-covariances.
 
-### Derivative plausibility
+### Derivatives and the independent edge witness
 
-The derivatives `v/a/j` are part of the state vector itself and directly affect level prediction. Their operational weight is therefore based on how typical their magnitude is for the process, not on how strongly they differ from zero.
+The derivatives `v/a/j` are part of the state vector and directly affect level prediction. Starting with 0.5.0-dev.38 their operational weight is driven primarily by agreement between the Bayesian state and an independent causal witness built only from direct raw/fused observations.
 
-The filter learns local-polynomial derivatives from long Recorder history. For every derivative order it estimates a robust historical scale:
+Long Recorder history still provides robust historical scales
 
 ```text
 sigma_hist = 1.4826 * MAD(d)
 ```
 
-Training windows that cross confirmed level regime changes are excluded. Historical segmentation uses the same semantics as live recovery: roughly 6 sigma deviation, three same-direction confirmations and a compact new plateau.
+but those scales now describe novelty more than correctness. A real new process may legitimately lie many historical sigmas outside the training distribution and still be accepted when direct observations confirm it.
 
-The production plausibility gate is centred at zero:
+The edge witness is a robust multiscale causal local-polynomial estimate:
 
 ```text
-z = |d| / sigma_hist
-
-w = exp(-z^2 / 2),  z < 5
-w = 0,              z >= 5
+short:   >= 25 points and >= 0.5 * process_timescale
+medium:  >= 40 points and >= 1.0 * process_timescale
+long:    >= 55 points and >= 2.0 * process_timescale
 ```
 
-A quiet process with derivative near zero therefore receives maximum weight, while abnormally large derivatives are suppressed.
+Rate and curvature use consistent estimates across multiple scales. Jerk requires two cubic estimates, medium and long. Every fit window must satisfy both the point-count and physical-time constraints.
 
-Higher orders inherit all lower-order penalties:
+When a witness is valid, each derivative order uses
+
+```text
+z_edge = |d_bayes - d_edge| / sigma_edge
+```
+
+with the local coupling weight
+
+```text
+w = 1,                         z_edge <= 1
+w = exp(-0.5 * (z_edge-1)^2),  1 < z_edge < 5
+w = 0,                         z_edge >= 5
+```
+
+Agreement within one witness sigma gets full trust. Beyond that the weight decays smoothly and reaches zero at 5 sigma. A large derivative is not penalized merely for being historically unusual when the independent witness confirms it.
+
+Higher orders remain hierarchical:
 
 ```text
 W_v = w_v
@@ -64,14 +79,39 @@ W_a = w_v * w_a
 W_j = w_v * w_a * w_j
 ```
 
-As dynamics become implausible, the effective model degrades monotonically:
+so the effective model still degrades monotonically:
 
 ```text
 x-v-a-j -> x-v-a -> x-v -> x
 ```
 
-Posterior derivative z-scores and covariance remain available in debug diagnostics, but they no longer act as permission for unbounded extrapolation.
+If no quality-passing edge witness is available for an order, the historical plausibility gate is used as a fallback. This keeps startup and post-gap behavior conservative until a new causal segment becomes observable.
 
+### Derivative recovery
+
+Destructive derivative recovery is triggered by persistent Bayes-to-edge disagreement rather than by one unusual sample:
+
+```text
+ENTER grace:  z_edge > 5
+CANCEL grace: z_edge < 3
+```
+
+Recovery requires at least five fresh edge updates and at least one `process_timescale_s` since the candidate began. When it fires, the first divergent derivative and the tail above it are reconditioned from witness hints.
+
+Historical 5-sigma recovery remains a fallback when no independent witness is available.
+
+### Observation gaps
+
+The edge witness is causal and must never fit across an interval in which the process was unobserved. Therefore
+
+```text
+gap > process_timescale_s
+=> start a new edge segment
+```
+
+Old edge history is excluded from the fit, unfinished recovery grace is cleared, external derivative weights are removed and historical fallback is used temporarily. The Bayesian latent state itself is not reset.
+
+Edge history is persisted independently in the checkpoint. Older or insufficient checkpoints are backfilled once from recent direct/fused Recorder observations.
 ## Robust multi-source fusion
 
 In multi-source mode the integration keeps the latest valid state of every source and rebuilds a common estimate at the current time whenever a source updates.
@@ -174,7 +214,7 @@ For count-derived and scaled-count signals, the Poisson-like runtime model uses 
 
 The integration writes a checkpoint to Home Assistant Store every **30 minutes**.
 
-The checkpoint contains `[x, v, a, j]`, covariance, process-noise parameters, source calibration and Recorder watermarks.
+The checkpoint contains `[x, v, a, j]`, covariance, process-noise parameters, source calibration, Recorder watermarks and the independent `edge_history`.
 
 After restart the filter catches up internally before exposing its first state:
 
@@ -323,6 +363,25 @@ dynamics:
     rate_mean_over_sigma: ...
     curvature_mean_over_sigma: ...
     jerk_mean_over_sigma: ...
+    rate_edge_z: ...
+    curvature_edge_z: ...
+    jerk_edge_z: ...
+    rate_edge_local_weight: ...
+    curvature_edge_local_weight: ...
+    jerk_edge_local_weight: ...
+
+  recovery:
+    count: ...
+    process_timescale_s: ...
+    edge_divergence:
+      enter_sigma: 5
+      cancel_sigma: 3
+
+  edge_witness:
+    process_timescale_s: ...
+    gap_limit_s: ...
+    segment_points: ...
+    segment_span_s: ...
 
 regime:
   candidate: false
@@ -352,8 +411,9 @@ last_update:
 - `bias` and `sigma` are slow source parameters; current physical motion should not relearn them every second.
 - Under `median`/`mean` anchoring, a common systematic offset shared by all sources is not identifiable. `passport` adds a prior, not a physical reference standard.
 - A source is not penalized merely for reporting slowly. Age increases uncertainty about its current value.
-- A derivative near zero is useful evidence of a quiet process and receives maximum plausibility weight.
-- Abnormally large derivatives are suppressed relative to their historical robust-MAD scale; at 5 sigma the local weight is zero.
+- Historical robust-MAD scale describes primarily how unusual current dynamics are, not whether they are correct.
+- With a valid edge witness, `v/a/j` weights are driven by Bayes-to-observation agreement: full weight through 1 sigma, then Gaussian decay to zero at 5 sigma.
+- Historical plausibility is used as a fallback while the edge witness is unavailable.
 - Confirmed level regime changes are not learned as huge rate/acceleration/jerk events: training windows that cross them are excluded.
 - As dynamics become implausible, the model degrades hierarchically from `x-v-a-j` toward `x`.
 - `characteristic_time_s: null` with `insufficient_signal` is a valid result: the filter should not invent a process timescale that is not observable.
@@ -372,6 +432,7 @@ custom_components/
     translations/
     core/
       dynamics.py
+      edge_derivatives.py
       filter.py
       gated_training.py
       noise_detection.py
