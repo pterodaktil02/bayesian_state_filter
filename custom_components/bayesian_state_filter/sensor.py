@@ -57,6 +57,10 @@ from .core.noise_detection import NoiseDetectionResult, detect_noise_model
 from .core.process_noise import IntegratedWienerProcessNoise
 from .core.state_models import AdaptivePolynomialStateModel
 from .core.gated_training import GatedDynamicsEstimate, train_gated_dynamics
+from .core.edge_derivatives import (
+    robust_causal_local_polynomial,
+    combine_multiscale_derivative,
+)
 from .core.training import (
     BiasAnchorResult,
     OnlineSourceCalibrator,
@@ -76,7 +80,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class BayesianEnsembleSensor(SensorEntity):
-    """Bayesian State Filter 0.5.0-dev.10.
+    """Bayesian State Filter 0.5.0-dev.24.
 
     Backward-compatible YAML platform. Multi-source observations are fused
     from the latest per-source estimates at a common time. Older source
@@ -229,6 +233,41 @@ class BayesianEnsembleSensor(SensorEntity):
         self._characteristic: CharacteristicTimeEstimate | None = None
         self._level_history = deque(maxlen=self._level_history_max_points)
         self._level_grid_step = 60.0
+
+        # Independent causal derivative witness built only from direct
+        # raw/fused observations. It has no derivative-transport feedback path.
+        # During normal tracking it is diagnostic only; if the historical
+        # plausibility gate rejects a derivative tail, the witness may be used
+        # once as a conservative recovery pseudo-measurement for v/a.
+        self._edge_history = deque(maxlen=4096)
+        self._edge_derivative_estimate = None
+        self._edge_witness_scales = {}
+        self._edge_rate_consensus = None
+        self._edge_curvature_consensus = None
+        self._edge_witness_tau_s = None
+        self._edge_derivative_scales = {}
+        self._edge_derivative_consensus = {}
+        self._edge_witness_tau_s = None
+
+        # Recovery diagnostics for hierarchical derivative reconditioning.
+        self._derivative_recondition_count = 0
+        self._last_derivative_recondition = None
+        # Independent edge witness guard. A witness may repair the latent
+        # derivative state only if it is multiscale-consistent, within the
+        # history-trained plausibility envelope, and (at runtime) disagrees
+        # persistently with the Bayesian posterior.
+        self._edge_witness_plausibility_sigma = 3.0
+        self._edge_divergence_sigma = 5.0
+        self._edge_divergence_confirm_updates = 5
+        self._edge_divergence_counts = {1: 0, 2: 0, 3: 0}
+        self._edge_divergence_bad_since = {1: None, 2: None, 3: None}
+        self._edge_divergence_cancel_sigma = 3.0
+        self._edge_last_divergence_z = {1: 0.0, 2: 0.0, 3: 0.0}
+        self._edge_agreement_z = {1: None, 2: None, 3: None}
+        self._edge_agreement_local_weight = {1: None, 2: None, 3: None}
+        self._edge_jerk_witness_scales = {}
+        self._edge_jerk_consensus = None
+        self._edge_last_update_ts = None
         self._characteristic_task = None
         self._last_characteristic_fit_ts = 0.0
 
@@ -334,7 +373,20 @@ class BayesianEnsembleSensor(SensorEntity):
         self._fallback_enter_z = 8.0
         self._fallback_exit_z = 3.0
         self._fallback_exit_confirmations = 5
-        self._fallback_derivative_weight_threshold = 0.01
+        # Hard derivative recovery is intentionally much slower than the
+        # continuous plausibility gate.  The gate may suppress an implausible
+        # derivative immediately; destructive tail reset is allowed only when
+        # the first bad derivative remains beyond 5 historical sigmas for both
+        # a minimum number of observations and several trained process
+        # timescales.
+        self._derivative_recovery_enter_sigma = 5.0
+        self._derivative_recovery_cancel_sigma = 4.0
+        self._derivative_recovery_confirm_updates = 5
+        self._derivative_recovery_timescale_factor = 1.0
+        self._fallback_derivative_weight_threshold = 0.0
+        self._fallback_derivative_weight_confirm_updates = self._derivative_recovery_confirm_updates
+        self._fallback_derivative_weight_counts = {1: 0, 2: 0, 3: 0}
+        self._derivative_recovery_bad_since = {1: None, 2: None, 3: None}
         self._fallback_last_event = None
 
         # Per-source live diagnostics.  These are presentation-only and are
@@ -343,7 +395,7 @@ class BayesianEnsembleSensor(SensorEntity):
         self._source_last_diag: dict[str, dict] = {}
         self._ready = False
         self._last_save_ts = 0.0
-        self._checkpoint_version = 10
+        self._checkpoint_version = 12  # dev.27: derivative plausibility is retrained at gated dynamics timescale
         self._checkpoint_config_fingerprint = self._make_checkpoint_config_fingerprint()
         self._last_processed_by_source: dict[str, float] = {}
         self._startup_mode = "initializing"
@@ -391,7 +443,7 @@ class BayesianEnsembleSensor(SensorEntity):
             try:
                 await self._initialize()
             except Exception:
-                _LOGGER.exception("Bayesian State Filter 0.5.0-dev.10 initialization failed")
+                _LOGGER.exception("Bayesian State Filter 0.5.0-dev.24 initialization failed")
                 await self._restore_fallback()
             # Finish hidden startup synchronization before publishing anything.
             # Recorder catch-up plus the latest in-memory source states bridge the
@@ -432,12 +484,25 @@ class BayesianEnsembleSensor(SensorEntity):
                     lambda: detect_noise_model(pseudo_history)
                 )
             self._apply_noise_model()
+
+            # Prefer the independently persisted edge history. Older
+            # checkpoints do not have it, so first try the restored level
+            # history and finally perform a one-time recent Recorder backfill.
+            if self._edge_history_observable():
+                self._recompute_edge_witness()
+                self._edge_last_update_ts = float(self._edge_history[-1][0])
+                self._update_edge_agreement_weights()
+            else:
+                self._seed_edge_history_from_level_history()
+                if not self._edge_history_observable():
+                    await self._backfill_edge_history_from_recorder()
+
             await self._catch_up_from_recorder()
             if self.filter.t_last is not None:
                 self._state = round(float(self.filter.x[0]), 6)
                 self._build_attrs(last_out=None)
             _LOGGER.info(
-                "Bayesian State Filter 0.5.0-dev.10 restored checkpoint and caught up incrementally; t=%.3f",
+                "Bayesian State Filter 0.5.0-dev.24 restored checkpoint and caught up incrementally; t=%.3f",
                 float(self.filter.t_last or 0.0),
             )
             return
@@ -523,6 +588,14 @@ class BayesianEnsembleSensor(SensorEntity):
             self._apply_derivative_plausibility()
 
         self._apply_noise_model()
+
+        # Full bootstrap already has the direct/fused Recorder history in
+        # _level_history and has just established the process timescale.
+        # Prime the causal witness now so the first published state and any
+        # startup derivative reconciliation have historical edge evidence.
+        self._seed_edge_history_from_level_history()
+        if not self._edge_history_observable():
+            await self._backfill_edge_history_from_recorder()
 
         if result.fused_points:
             await self.hass.async_add_executor_job(self._replay_fused, dynamics_points)
@@ -819,6 +892,44 @@ class BayesianEnsembleSensor(SensorEntity):
 
         regime_recovered = self._maybe_recover_regime_change(t, corrected, variance, out)
 
+        # Keep the independent causal witness current before derivative
+        # recovery decisions.  It is built only from direct/fused observations,
+        # never from the latent Bayesian derivative state.
+        edge_updated = self._append_edge_snapshot(t)
+        # Coupling for the next causal prediction is determined by how well the
+        # current Bayesian derivatives agree with the latest independent edge
+        # witness. This is refreshed on every source event because Bayes can
+        # move even when edge cadence suppresses a new witness point.
+        self._update_edge_agreement_weights()
+
+        # Two recovery layers:
+        #   1) historical 5-sigma fallback after max(5 effective updates,
+        #      1 process timescale), only when no valid edge witness exists;
+        #   2) independent Bayes<->edge watchdog: enter beyond 5 witness sigma,
+        #      cancel below 3, recover after max(5 fresh edge updates, 1 tau).
+        #
+        # Only one destructive derivative repair is allowed per live update.
+        derivative_recovery = None
+        if not regime_recovered:
+            derivative_recovery = self._maybe_reset_persistently_untrusted_derivative_tail(t)
+            if derivative_recovery is not None:
+                self._record_derivative_recondition(
+                    t, derivative_recovery,
+                    reason=derivative_recovery.get(
+                        "reason", "persistent_5sigma_timescale_recovery"
+                    ),
+                )
+            elif edge_updated:
+                derivative_recovery = self._runtime_edge_divergence_recovery()
+                if derivative_recovery is not None:
+                    self._record_derivative_recondition(
+                        t, derivative_recovery,
+                        reason="persistent_edge_divergence",
+                    )
+
+        if derivative_recovery is not None:
+            self._update_edge_agreement_weights()
+
         # Source health is diagnostic evidence about the triggering source
         # relative to the contemporaneous ensemble, not the Kalman innovation
         # of the fused measurement. This avoids attributing a common process
@@ -1007,10 +1118,25 @@ class BayesianEnsembleSensor(SensorEntity):
         if before > 0.0 and after >= before:
             self._startup_sync_gap_s = max(self._startup_sync_gap_s, after - before)
 
+        # Startup replay goes through the same persistence gate as live data.
+        # The counters are updated for every replayed measurement, so a stale
+        # checkpoint tail is reset only if its low plausibility weight persists
+        # for the configured number of consecutive observations.
+        startup_recovery = self._maybe_reset_persistently_untrusted_derivative_tail(
+            float(self.filter.t_last or after or before or 0.0),
+            count_update=False,
+        )
+        if startup_recovery is not None:
+            self._record_derivative_recondition(
+                float(self.filter.t_last or after or before or 0.0),
+                startup_recovery,
+                reason="startup_persistent_5sigma_timescale_recovery",
+            )
+
         if self.filter.t_last is not None:
             self._state = round(float(self.filter.x[0]), 6)
             self._build_attrs(last_out=None)
-        if replayed or current_replayed:
+        if replayed or current_replayed or startup_recovery is not None:
             await self._save_state()
 
         _LOGGER.info(
@@ -1350,6 +1476,1001 @@ class BayesianEnsembleSensor(SensorEntity):
         if with_components:
             return z, var, components
         return z, var
+
+    def _edge_recovery_hints(self):
+        """Return independent v/a/j witness estimates suitable for recovery.
+
+        A witness is admitted by observability and internal multiscale
+        consistency, not by historical derivative magnitude.  A real novel
+        process may legitimately lie far outside the training distribution;
+        historical sigma measures novelty, not correctness.
+        """
+        consensus = self._edge_derivative_consensus
+        if not consensus:
+            return {}
+
+        hints = {}
+        candidates = {}
+        rate_consensus = consensus.get("rate")
+        curvature_consensus = consensus.get("curvature")
+        jerk_consensus = consensus.get("jerk")
+
+        if (
+            rate_consensus is not None
+            and int(rate_consensus.estimates) >= 2
+            and float(rate_consensus.worst_disagreement_z) <= 2.0
+        ):
+            candidates[1] = (rate_consensus.value, rate_consensus.sigma)
+
+        if (
+            curvature_consensus is not None
+            and int(curvature_consensus.estimates) >= 2
+            and float(curvature_consensus.worst_disagreement_z) <= 2.0
+        ):
+            candidates[2] = (curvature_consensus.value, curvature_consensus.sigma)
+
+        if (
+            jerk_consensus is not None
+            and int(jerk_consensus.estimates) >= 2
+            and float(jerk_consensus.worst_disagreement_z) <= 2.0
+        ):
+            candidates[3] = (jerk_consensus.value, jerk_consensus.sigma)
+
+        for order, pair in candidates.items():
+            try:
+                value = float(pair[0])
+                sigma = float(pair[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (
+                math.isfinite(value)
+                and math.isfinite(sigma)
+                and sigma > 0.0
+            ):
+                continue
+            hints[order] = (value, sigma)
+
+        return hints
+
+
+    def _maybe_reset_persistently_untrusted_derivative_tail(
+        self, t: float | None = None, *, count_update: bool = True
+    ):
+        """Hard-reset a derivative tail only after a sustained 5-sigma failure.
+
+        The normal derivative plausibility gate remains the fast protection
+        mechanism.  Recovery is destructive and therefore requires the first
+        implausible derivative in the hierarchy to remain outside the
+        history-trained 5-sigma envelope for BOTH:
+
+        * ``_derivative_recovery_confirm_updates`` observations; and
+        * one ``gated_dynamics.timescale_s``.
+
+        A candidate is cancelled once it returns below 4 sigma.  Values between
+        4 and 5 sigma keep an existing candidate alive but do not start a new
+        one, which provides hysteresis around the entry boundary.
+        """
+        model = self.filter.state_model
+        dim = int(model.dim_x())
+        now = float(
+            self.filter.t_last if t is None and self.filter.t_last is not None
+            else (0.0 if t is None else t)
+        )
+
+        params = model.derivative_plausibility_parameters()
+        scales = list(params.get("scales", []) or [])
+
+        enter_z = float(self._derivative_recovery_enter_sigma)
+        cancel_z = float(self._derivative_recovery_cancel_sigma)
+        required_updates = max(1, int(self._derivative_recovery_confirm_updates))
+
+        # This is the trained process timescale requested for recovery timing.
+        process_timescale = None
+        if self._gated_dynamics is not None:
+            try:
+                candidate_T = float(self._gated_dynamics.timescale_s)
+                if math.isfinite(candidate_T) and candidate_T > 0.0:
+                    process_timescale = candidate_T
+            except Exception:
+                pass
+        if process_timescale is None:
+            try:
+                candidate_T = float(self.filter.tau)
+                if math.isfinite(candidate_T) and candidate_T > 0.0:
+                    process_timescale = candidate_T
+            except Exception:
+                pass
+        if process_timescale is None:
+            return None
+
+        required_duration = (
+            float(self._derivative_recovery_timescale_factor) * process_timescale
+        )
+
+        first_bad = None
+        first_bad_z = None
+
+        # Hierarchical semantics: only the first currently bad derivative can
+        # initiate recovery; all higher orders belong to the same discarded
+        # tail and are not independent recovery candidates.
+        for order in range(1, dim):
+            scale = float(scales[order]) if order < len(scales) else float("nan")
+            value = float(self.filter.x[order])
+
+            if not math.isfinite(scale) or scale <= 0.0 or not math.isfinite(value):
+                self._fallback_derivative_weight_counts[order] = 0
+                self._derivative_recovery_bad_since[order] = None
+                continue
+
+            z = abs(value) / scale
+            since = self._derivative_recovery_bad_since.get(order)
+
+            if since is None:
+                if z >= enter_z:
+                    first_bad = order
+                    first_bad_z = z
+                    self._derivative_recovery_bad_since[order] = now
+                    self._fallback_derivative_weight_counts[order] = 1 if count_update else 0
+                else:
+                    self._fallback_derivative_weight_counts[order] = 0
+                # If this derivative is healthy, continue looking higher.
+                if z < enter_z:
+                    continue
+                break
+
+            # Existing candidate: cancel only after returning below 4 sigma.
+            if z < cancel_z:
+                self._derivative_recovery_bad_since[order] = None
+                self._fallback_derivative_weight_counts[order] = 0
+                continue
+
+            first_bad = order
+            first_bad_z = z
+            if count_update:
+                self._fallback_derivative_weight_counts[order] = (
+                    int(self._fallback_derivative_weight_counts.get(order, 0)) + 1
+                )
+            break
+
+        # Any higher-order candidates are invalid whenever a lower-order
+        # derivative is the active first bad member of the cascade.
+        if first_bad is not None:
+            for order in range(first_bad + 1, dim):
+                self._derivative_recovery_bad_since[order] = None
+                self._fallback_derivative_weight_counts[order] = 0
+
+        if first_bad is None:
+            return None
+
+        since = self._derivative_recovery_bad_since.get(first_bad)
+        elapsed = max(0.0, now - float(since if since is not None else now))
+        updates = int(self._fallback_derivative_weight_counts.get(first_bad, 0))
+
+        if updates < required_updates or elapsed < required_duration:
+            return None
+
+        # A valid edge witness makes historical 5-sigma a novelty flag only.
+        # For any derivative with a valid witness, correctness is decided by Bayes<->edge
+        # disagreement, so defer to the edge watchdog instead of resetting a
+        # potentially real new process.
+        edge_hints = self._edge_recovery_hints()
+        if first_bad in edge_hints:
+            self._fallback_derivative_weight_counts[first_bad] = 0
+            self._derivative_recovery_bad_since[first_bad] = None
+            return None
+
+        # Prefer an independent causal edge witness when it has passed its
+        # own observability, multiscale-consistency and historical-plausibility
+        # gates.  This gives the repaired tail a data-derived local state
+        # instead of repeatedly dropping it onto the same zero prior.  If no
+        # witness is trustworthy, retain the conservative zero-prior fallback.
+        hints = self._edge_recovery_hints()
+        if hints:
+            recovery = self.filter.recondition_derivatives_from_hints(
+                start_order=first_bad,
+                derivative_hints=hints,
+                reason="persistent_5sigma_timescale_edge_recondition",
+            )
+        else:
+            # z>=5 maps to zero plausibility weight in the production model, so
+            # a zero threshold resets exactly the confirmed bad tail.
+            recovery = self.filter.reset_untrusted_derivative_tail(
+                weight_threshold=float(self._fallback_derivative_weight_threshold)
+            )
+        if recovery is None:
+            return None
+
+        for order in range(first_bad, dim):
+            self._fallback_derivative_weight_counts[order] = 0
+            self._derivative_recovery_bad_since[order] = None
+
+        recovery["confirm_updates"] = required_updates
+        recovery["confirmed_from_order"] = int(first_bad)
+        recovery["trigger_z"] = float(first_bad_z)
+        recovery["confirm_duration_s"] = float(required_duration)
+        recovery["candidate_elapsed_s"] = float(elapsed)
+        recovery["process_timescale_s"] = float(process_timescale)
+        recovery["timescale_factor"] = float(self._derivative_recovery_timescale_factor)
+        return recovery
+
+
+    def _record_derivative_recondition(self, t, recovery, *, reason=None):
+        """Persist/log one derivative-tail repair in a common format."""
+        if recovery is None:
+            return
+        self._derivative_recondition_count += 1
+        names = {1: "rate", 2: "curvature", 3: "jerk"}
+        start_order = int(recovery.get("from_order", 1))
+        applied_hints = dict(recovery.get("applied_hints", {}) or {})
+        why = str(reason or recovery.get("reason") or "plausibility_rejection")
+        self._last_derivative_recondition = {
+            "timestamp": float(t),
+            "from_order": start_order,
+            "from_name": names.get(start_order, str(start_order)),
+            "trigger_z": float(recovery.get("trigger_z", float("nan"))),
+            "old_derivatives": list(recovery.get("old_derivatives", []) or []),
+            "restored_sigmas": dict(recovery.get("restored_sigmas", {}) or {}),
+            "applied_hints": applied_hints,
+            "reason": why,
+            "candidate_elapsed_s": recovery.get("candidate_elapsed_s"),
+            "confirm_duration_s": recovery.get("confirm_duration_s"),
+            "process_timescale_s": recovery.get("process_timescale_s"),
+            "timescale_factor": recovery.get("timescale_factor"),
+        }
+        _LOGGER.warning(
+            "Bayesian State Filter derivative tail reconditioned from %s: "
+            "reason=%s edge_hints=%s",
+            names.get(start_order, start_order), why, sorted(applied_hints),
+        )
+
+    def _startup_reconcile_derivatives_from_edge(self):
+        """One-shot startup repair only when Bayes actually disagrees with the witness.
+
+        A valid causal witness is *evidence*, not an instruction to overwrite a
+        healthy checkpoint.  This matters for slow/noisy processes (radiation is
+        the canonical example): the endpoint fit may be perfectly valid yet
+        merely represent a harmless local slope different from an already
+        converged Bayesian derivative state.
+
+        Startup therefore uses the same independent-witness divergence concept
+        as the live watchdog, but without the three-update persistence delay:
+
+        * witness must first pass N+span observability, multiscale consistency
+          and internal quality gates in ``_edge_recovery_hints``;
+        * Bayes must then differ by more than ``_edge_divergence_sigma`` witness
+          sigmas for rate, curvature or jerk;
+        * only the first divergent order and the derivative tail above it are
+          hard reconditioned from the corresponding multiscale witness.
+
+        Divergence is measured against the witness' own multiscale
+        uncertainty.  Historical robust sigma describes novelty only. A
+        healthy slow process therefore remains
+        untouched when Bayes and witness agree, while a runaway derivative is
+        not allowed to hide behind a deliberately inflated reference sigma.
+        """
+        hints = self._edge_recovery_hints()
+        if not hints:
+            return None
+
+        trigger_order = None
+        trigger_z = None
+        for order in (1, 2, 3):
+            hint = hints.get(order)
+            if hint is None or order >= len(self.filter.x):
+                self._edge_last_divergence_z[order] = 0.0
+                continue
+            witness_value, witness_sigma = float(hint[0]), float(hint[1])
+            reference_sigma = max(
+                witness_sigma, math.sqrt(NUMERIC_VARIANCE_FLOOR)
+            )
+            z = abs(float(self.filter.x[order]) - witness_value) / reference_sigma
+            self._edge_last_divergence_z[order] = float(z)
+            if math.isfinite(z) and z > float(self._edge_divergence_sigma):
+                trigger_order = order
+                trigger_z = float(z)
+                break
+
+        if trigger_order is None:
+            return None
+
+        recovery = self.filter.recondition_derivatives_from_hints(
+            start_order=trigger_order,
+            derivative_hints=hints,
+            reason="startup_edge_witness",
+        )
+        if recovery is not None and trigger_z is not None:
+            recovery["trigger_z"] = float(trigger_z)
+        return recovery
+
+    @staticmethod
+    def _edge_agreement_weight(z: float) -> float:
+        """Map Bayes<->edge disagreement to a local coupling weight.
+
+        Full trust inside one witness sigma, then a shifted Gaussian tail,
+        with a hard five-sigma rejection:
+
+            w = 1                              z <= 1
+            w = exp(-0.5 * (z - 1)^2)         1 < z < 5
+            w = 0                              z >= 5
+        """
+        z = float(z)
+        if not math.isfinite(z):
+            return 0.0
+        if z <= 1.0:
+            return 1.0
+        if z >= 5.0:
+            return 0.0
+        return float(math.exp(-0.5 * (z - 1.0) ** 2))
+
+    def _update_edge_agreement_weights(self):
+        """Update witness-based local v/a/j coupling weights.
+
+        A valid multiscale edge witness overrides historical magnitude gating
+        for the corresponding derivative. If no valid witness exists, the
+        state model receives no override and falls back to history.
+        """
+        model = self.filter.state_model
+        if not hasattr(model, "set_external_derivative_weights"):
+            return
+
+        hints = self._edge_recovery_hints()
+        external = {}
+        for order in (1, 2, 3):
+            hint = hints.get(order)
+            if hint is None or order >= len(self.filter.x):
+                self._edge_agreement_z[order] = None
+                self._edge_agreement_local_weight[order] = None
+                continue
+
+            witness_value, witness_sigma = float(hint[0]), float(hint[1])
+            reference_sigma = max(
+                witness_sigma, math.sqrt(NUMERIC_VARIANCE_FLOOR)
+            )
+            z = abs(float(self.filter.x[order]) - witness_value) / reference_sigma
+            weight = self._edge_agreement_weight(z)
+            self._edge_agreement_z[order] = float(z)
+            self._edge_agreement_local_weight[order] = float(weight)
+            external[order] = float(weight)
+
+        model.set_external_derivative_weights(external)
+
+    def _runtime_edge_divergence_recovery(self):
+        """Recover only from sustained Bayes<->edge disagreement.
+
+        ENTER grace at >5 witness sigma.
+        CANCEL grace at <3 witness sigma.
+        The 3..5 sigma band preserves the current grace state.
+
+        Recovery requires BOTH at least five fresh independent edge updates
+        above the 5-sigma entry boundary and at least one trained process
+        timescale since grace began.  The effective grace is therefore
+        max(time for five edge updates, process_timescale_s).
+        """
+        hints = self._edge_recovery_hints()
+        if not hints:
+            for order in self._edge_divergence_counts:
+                self._edge_divergence_counts[order] = 0
+                self._edge_divergence_bad_since[order] = None
+                self._edge_last_divergence_z[order] = 0.0
+            return None
+
+        if self._gated_dynamics is not None:
+            process_timescale = float(self._gated_dynamics.timescale_s)
+        else:
+            process_timescale = float(self.filter.tau)
+        if not math.isfinite(process_timescale) or process_timescale <= 0.0:
+            return None
+
+        now = float(
+            self._edge_last_update_ts
+            if self._edge_last_update_ts is not None
+            else (self.filter.t_last or 0.0)
+        )
+        enter_sigma = float(self._edge_divergence_sigma)
+        cancel_sigma = float(self._edge_divergence_cancel_sigma)
+        required_updates = max(1, int(self._edge_divergence_confirm_updates))
+        required_duration = float(process_timescale)
+
+        trigger_order = None
+        trigger_z = None
+
+        for order in (1, 2, 3):
+            hint = hints.get(order)
+            if hint is None or order >= len(self.filter.x):
+                self._edge_divergence_counts[order] = 0
+                self._edge_divergence_bad_since[order] = None
+                self._edge_last_divergence_z[order] = 0.0
+                continue
+
+            witness_value, witness_sigma = float(hint[0]), float(hint[1])
+            bayes_value = float(self.filter.x[order])
+            reference_sigma = max(
+                witness_sigma, math.sqrt(NUMERIC_VARIANCE_FLOOR)
+            )
+            z = abs(bayes_value - witness_value) / reference_sigma
+            self._edge_last_divergence_z[order] = float(z)
+
+            since = self._edge_divergence_bad_since.get(order)
+
+            if z < cancel_sigma:
+                # Bayes has returned to agreement during grace.
+                self._edge_divergence_counts[order] = 0
+                self._edge_divergence_bad_since[order] = None
+                continue
+
+            if since is None:
+                if z > enter_sigma:
+                    self._edge_divergence_bad_since[order] = now
+                    self._edge_divergence_counts[order] = 1
+                else:
+                    # 3..5 sigma cannot start grace.
+                    continue
+            else:
+                if z > enter_sigma:
+                    self._edge_divergence_counts[order] += 1
+                # 3..5 sigma: keep grace alive, but do not count another
+                # strong independent confirmation.
+
+            since = self._edge_divergence_bad_since.get(order)
+            elapsed = max(
+                0.0,
+                now - float(since if since is not None else now),
+            )
+
+            if (
+                self._edge_divergence_counts[order] >= required_updates
+                and elapsed >= required_duration
+            ):
+                trigger_order = order
+                trigger_z = float(z)
+                break
+
+        if trigger_order is None:
+            return None
+
+        recovery = self.filter.recondition_derivatives_from_hints(
+            start_order=trigger_order,
+            derivative_hints=hints,
+            reason="persistent_edge_divergence",
+        )
+        if recovery is not None:
+            since = self._edge_divergence_bad_since.get(trigger_order)
+            recovery["trigger_z"] = trigger_z
+            recovery["confirm_updates"] = required_updates
+            recovery["confirm_duration_s"] = required_duration
+            recovery["candidate_elapsed_s"] = max(
+                0.0,
+                now - float(since if since is not None else now),
+            )
+            recovery["process_timescale_s"] = float(process_timescale)
+            recovery["timescale_factor"] = 1.0
+
+        for order in self._edge_divergence_counts:
+            self._edge_divergence_counts[order] = 0
+            self._edge_divergence_bad_since[order] = None
+
+        return recovery
+
+
+    def _seed_edge_history_from_level_history(self):
+        """Prime the edge witness from fused history after a restart.
+
+        Startup observability must satisfy BOTH constraints of the longest
+        witness: at least 55 points and at least 2 process timescales of span.
+        This matters for sparse sources: selecting only by elapsed span can
+        leave too few points even when Recorder already contains enough history.
+        """
+        if not self._level_history:
+            return
+
+        if self._gated_dynamics is not None:
+            tau_s = float(self._gated_dynamics.timescale_s)
+        else:
+            tau_s = float(self.filter.tau)
+        if not math.isfinite(tau_s) or tau_s <= 0.0:
+            tau_s = 1.0
+        tau_s = max(tau_s, 1.0)
+
+        required_span_s = 2.0 * tau_s
+        required_points = 55
+
+        rows = [
+            (float(t), float(z), max(float(var), NUMERIC_VARIANCE_FLOOR))
+            for t, z, var in self._level_history
+            if math.isfinite(float(t))
+            and math.isfinite(float(z))
+            and math.isfinite(float(var))
+            and float(var) > 0.0
+        ]
+        if not rows:
+            return
+
+        rows.sort(key=lambda x: x[0])
+        newest = rows[-1][0]
+
+        # Satisfy both constraints.  Start far enough back for 2*tau and, for
+        # sparse data, at least as far back as the 55th point from the end.
+        span_cutoff = newest - max(required_span_s, 1.0)
+        if len(rows) >= required_points:
+            count_cutoff = float(rows[-required_points][0])
+            cutoff = min(span_cutoff, count_cutoff)
+        else:
+            cutoff = span_cutoff
+
+        first = 0
+        for i, row in enumerate(rows):
+            if float(row[0]) >= cutoff:
+                first = i
+                break
+        tail = rows[first:]
+
+        # Discrete timestamps can make the first selected sample a fraction of
+        # a cadence too new for the exact 2*tau requirement. Extend backwards
+        # until both observability conditions are truly satisfied.
+        while first > 0 and (
+            len(tail) < required_points
+            or newest - float(tail[0][0]) < required_span_s
+        ):
+            first -= 1
+            tail.insert(0, rows[first])
+
+        # Keep the hot-path buffer bounded. If Recorder history is dense,
+        # uniform decimation preserves both endpoints and therefore the span.
+        max_keep = self._edge_history.maxlen or 4096
+        if len(tail) > max_keep:
+            keep = max(required_points, int(max_keep))
+            idx = np.linspace(0, len(tail) - 1, keep, dtype=int)
+            tail = [tail[int(i)] for i in idx]
+
+        self._edge_history.clear()
+        self._edge_history.extend(tail)
+        self._recompute_edge_witness()
+        if self.filter.t_last is not None:
+            self._update_edge_agreement_weights()
+
+
+    def _edge_history_observable(self) -> bool:
+        """Return True when the latest causal edge segment satisfies the long gate."""
+        self._trim_edge_history_to_latest_segment()
+        if len(self._edge_history) < 55:
+            return False
+        tau_s = self._edge_process_timescale_s()
+        span_s = float(self._edge_history[-1][0]) - float(self._edge_history[0][0])
+        return math.isfinite(span_s) and span_s >= 2.0 * tau_s
+
+    async def _backfill_edge_history_from_recorder(self) -> bool:
+        """Build missing edge history directly from recent Recorder source rows.
+
+        This is a one-time compatibility/backfill path for checkpoints created
+        before edge_history became persistent, or for an otherwise insufficient
+        saved witness buffer. It reproduces the live direct-observation witness:
+        calibrated source values, normal freshness gates, robust fusion, and
+        witness cadence throttling, but never transports values with latent
+        Bayesian derivatives.
+        """
+        if self._edge_history_observable():
+            self._recompute_edge_witness()
+            if self.filter.t_last is not None:
+                self._update_edge_agreement_weights()
+            return True
+
+        if not self._calibrations:
+            return False
+
+        if self._gated_dynamics is not None:
+            tau_s = float(self._gated_dynamics.timescale_s)
+        else:
+            tau_s = float(self.filter.tau)
+        if not math.isfinite(tau_s) or tau_s <= 0.0:
+            return False
+
+        cadences = [
+            float(cal.median_dt)
+            for cal in self._calibrations.values()
+            if math.isfinite(float(cal.median_dt)) and float(cal.median_dt) > 0.0
+        ]
+        median_dt = float(statistics.median(cadences)) if cadences else 1.0
+
+        # Longest witness needs 55 points and 2*tau. Ask for a modest margin on
+        # both constraints so Recorder timestamp jitter/freshness does not leave
+        # us one sample short.
+        required_horizon_s = max(
+            2.2 * tau_s,
+            1.2 * 55.0 * median_dt,
+            180.0,
+        )
+        end_ts = float(self.filter.t_last or datetime.now(timezone.utc).timestamp())
+        start_ts = max(0.0, end_ts - required_horizon_s)
+
+        histories = {}
+        for src in self.sources:
+            seq = await self._fetch_history(src, start_ts=start_ts)
+            parsed = self._parse_states(seq)
+            if parsed:
+                histories[src] = parsed
+        if not histories:
+            return False
+
+        events = []
+        for src, seq in histories.items():
+            for t, raw in seq:
+                if t <= end_ts + 1e-6:
+                    events.append((float(t), src, float(raw)))
+        events.sort(key=lambda x: (x[0], x[1]))
+        if not events:
+            return False
+
+        cache = {}
+        rebuilt = []
+        min_dt = max(0.80 * median_dt, 0.05)
+        last_edge_t = None
+        tau_fresh = self._window_tau()
+        mode = self._runtime_noise_mode
+
+        for t, src, raw in events:
+            cache[src] = (t, raw)
+            if last_edge_t is not None and t - last_edge_t < min_dt:
+                continue
+
+            values, variances, labels = [], [], []
+            for entity_id, (t_src, raw_src) in cache.items():
+                cal = self._calibrations.get(entity_id)
+                if cal is None:
+                    continue
+                age = max(t - float(t_src), 0.0)
+                max_age = max(
+                    FRESHNESS_MEDIAN_DT_MULTIPLIER * cal.median_dt,
+                    FRESHNESS_TAU_FRACTION * tau_fresh,
+                    FRESHNESS_MIN_S,
+                )
+                if age > max_age:
+                    continue
+
+                corrected = float(raw_src) - float(cal.bias)
+                variance = cal.variance(
+                    corrected,
+                    noise_mode=mode,
+                    level_fraction=self._runtime_level_fraction,
+                )
+                if not (math.isfinite(corrected) and math.isfinite(variance)):
+                    continue
+                values.append(corrected)
+                variances.append(max(float(variance), NUMERIC_VARIANCE_FLOOR))
+                labels.append(entity_id)
+
+            if len(values) < self.min_sources:
+                continue
+            fused = self._robust_fuse(values, variances, labels)
+            if fused is None:
+                continue
+            z, var, _components = fused
+            rebuilt.append(
+                (float(t), float(z), max(float(var), NUMERIC_VARIANCE_FLOOR))
+            )
+            last_edge_t = float(t)
+
+        if not rebuilt:
+            return False
+
+        # Merge with any persisted rows, deduplicate by timestamp, and retain a
+        # bounded causal tail.
+        merged = {}
+        for row in list(self._edge_history) + rebuilt:
+            merged[float(row[0])] = (
+                float(row[0]),
+                float(row[1]),
+                max(float(row[2]), NUMERIC_VARIANCE_FLOOR),
+            )
+        rows = [merged[k] for k in sorted(merged)]
+        max_keep = self._edge_history.maxlen or 4096
+        rows = rows[-max_keep:]
+
+        self._edge_history.clear()
+        self._edge_history.extend(rows)
+        if self._edge_history:
+            self._edge_last_update_ts = float(self._edge_history[-1][0])
+
+        self._recompute_edge_witness()
+        if self.filter.t_last is not None:
+            self._update_edge_agreement_weights()
+
+        return self._edge_history_observable()
+
+    @staticmethod
+    def _edge_fit_points(history, min_span_s, min_points, max_fit_points=96):
+        """Return a bounded causal tail satisfying BOTH N and elapsed span.
+
+        The selected window must include at least ``min_points`` observations
+        and reach back at least ``min_span_s`` from the newest observation.
+        Sparse sources are therefore count-limited while dense sources are
+        span-limited.
+        """
+        rows = list(history)
+        if not rows:
+            return []
+
+        newest = float(rows[-1][0])
+        cutoff = newest - max(float(min_span_s), 0.0)
+
+        # Earliest index required by temporal span.
+        first_by_span = len(rows) - 1
+        for i in range(len(rows) - 1, -1, -1):
+            first_by_span = i
+            if float(rows[i][0]) <= cutoff:
+                break
+
+        # Earliest index required by sample count.
+        first_by_count = max(0, len(rows) - max(int(min_points), 1))
+
+        # To satisfy BOTH constraints, start at the earlier of the two.
+        first = min(first_by_span, first_by_count)
+        tail = rows[first:]
+
+        if len(tail) <= max_fit_points:
+            return tail
+
+        # Downsample only after the required causal tail has been selected.
+        # Preserve both endpoints so the temporal span cannot collapse.
+        keep = max(int(max_fit_points), int(min_points))
+        idx = np.linspace(0, len(tail) - 1, keep, dtype=int)
+        return [tail[int(i)] for i in idx]
+
+
+    def _edge_process_timescale_s(self) -> float:
+        """Return the physical process timescale used to segment edge history."""
+        if self._gated_dynamics is not None:
+            tau_s = float(self._gated_dynamics.timescale_s)
+        else:
+            tau_s = float(self.filter.tau)
+        if not math.isfinite(tau_s) or tau_s <= 0.0:
+            return 1.0
+        return max(tau_s, 1.0)
+
+    def _reset_edge_segment_state(self):
+        """Drop edge-derived trust/recovery state at a causal observation gap."""
+        self._edge_witness_scales = {}
+        self._edge_derivative_consensus = {}
+        self._edge_rate_consensus = None
+        self._edge_curvature_consensus = None
+        self._edge_jerk_witness_scales = {}
+        self._edge_jerk_consensus = None
+        self._edge_derivative_estimate = None
+
+        for order in self._edge_divergence_counts:
+            self._edge_divergence_counts[order] = 0
+            self._edge_divergence_bad_since[order] = None
+            self._edge_last_divergence_z[order] = 0.0
+            self._edge_agreement_z[order] = None
+            self._edge_agreement_local_weight[order] = None
+
+        # A historical hard-recovery candidate must not accumulate elapsed
+        # time through an interval in which the process was unobserved.
+        for order in self._fallback_derivative_weight_counts:
+            self._fallback_derivative_weight_counts[order] = 0
+            self._derivative_recovery_bad_since[order] = None
+
+        model = self.filter.state_model
+        if hasattr(model, "set_external_derivative_weights"):
+            model.set_external_derivative_weights({})
+
+    def _trim_edge_history_to_latest_segment(self):
+        """Keep only the latest contiguous edge segment.
+
+        A gap longer than one process timescale means the derivative trajectory
+        across the missing interval is unobserved. No local polynomial may span
+        such a gap.
+        """
+        if len(self._edge_history) < 2:
+            return False
+
+        gap_limit = self._edge_process_timescale_s()
+        rows = list(self._edge_history)
+        split_at = None
+        for i in range(len(rows) - 1, 0, -1):
+            gap = float(rows[i][0]) - float(rows[i - 1][0])
+            if math.isfinite(gap) and gap > gap_limit:
+                split_at = i
+                break
+
+        if split_at is None:
+            return False
+
+        tail = rows[split_at:]
+        self._edge_history.clear()
+        self._edge_history.extend(tail)
+        self._reset_edge_segment_state()
+        return True
+
+    def _append_edge_snapshot(self, now):
+        """Update independent causal derivative witnesses.
+
+        Returns True only when a fresh direct/fused observation was actually
+        appended.  Runtime divergence persistence is counted on these witness
+        updates rather than on every source event, so a dense multi-source
+        ensemble cannot manufacture three confirmations in a fraction of a
+        second.
+
+        A derivative is observable only when two independent conditions hold:
+        enough points *and* enough elapsed physical time.  The three nested
+        witnesses require respectively 25/40/55 points and at least
+        0.5/1/2 process timescales.  At startup the buffer is primed from
+        fused Recorder history, so a restart itself does not erase derivative
+        context.
+        """
+        snap = self._current_observed_snapshot(now)
+        if snap is None:
+            return False
+        z, var = snap
+
+        cadences = [
+            float(cal.median_dt)
+            for cal in self._calibrations.values()
+            if math.isfinite(float(cal.median_dt)) and float(cal.median_dt) > 0.0
+        ]
+        natural_dt = float(statistics.median(cadences)) if cadences else 1.0
+        min_dt = max(0.80 * natural_dt, 0.05)
+
+        if self._edge_history:
+            last_t = float(self._edge_history[-1][0])
+            if float(now) <= last_t:
+                return False
+
+            gap_s = float(now) - last_t
+            if gap_s > self._edge_process_timescale_s():
+                # Missing observations for longer than the physical process
+                # timescale terminate the causal derivative segment.
+                self._edge_history.clear()
+                self._reset_edge_segment_state()
+            elif gap_s < min_dt:
+                return False
+
+        self._edge_history.append(
+            (float(now), float(z), max(float(var), NUMERIC_VARIANCE_FLOOR))
+        )
+        self._edge_last_update_ts = float(now)
+
+        self._recompute_edge_witness()
+        return True
+
+    def _recompute_edge_witness(self):
+        """Recompute causal multiscale witnesses from the latest causal segment."""
+        self._trim_edge_history_to_latest_segment()
+        if not self._edge_history:
+            self._edge_witness_scales = {}
+            self._edge_derivative_consensus = {}
+            self._edge_rate_consensus = None
+            self._edge_curvature_consensus = None
+            self._edge_jerk_witness_scales = {}
+            self._edge_jerk_consensus = None
+            return
+
+        tau_s = self._edge_process_timescale_s()
+        self._edge_witness_tau_s = tau_s
+
+        specs = {
+            "short":  {"min_points": 25, "min_span_s": 0.5 * tau_s, "max_order": 1},
+            "medium": {"min_points": 40, "min_span_s": 1.0 * tau_s, "max_order": 2},
+            "long":   {"min_points": 55, "min_span_s": 2.0 * tau_s, "max_order": 3},
+        }
+
+        estimates = {}
+        for name, spec in specs.items():
+            fit_points = self._edge_fit_points(
+                self._edge_history,
+                spec["min_span_s"],
+                spec["min_points"],
+            )
+            estimates[name] = robust_causal_local_polynomial(
+                fit_points,
+                max_points=96,
+                max_order=spec["max_order"],
+                min_points=spec["min_points"],
+                min_span_s=spec["min_span_s"],
+                tukey_c=2.5,
+                max_iter=6,
+            )
+
+        valid = {k: v for k, v in estimates.items() if v is not None}
+        self._edge_witness_scales = valid
+        self._edge_derivative_estimate = (
+            valid.get("medium") or valid.get("long") or valid.get("short")
+        )
+
+        # Jerk needs at least two independent scale estimates just like v/a.
+        # Preserve the existing linear/quadratic production fits for rate and
+        # curvature; compute a separate cubic fit on the medium window and pair
+        # it with the existing cubic long-window fit.
+        medium_jerk_points = self._edge_fit_points(
+            self._edge_history, 1.0 * tau_s, 40
+        )
+        medium_jerk = robust_causal_local_polynomial(
+            medium_jerk_points,
+            max_points=96,
+            max_order=3,
+            min_points=40,
+            min_span_s=1.0 * tau_s,
+            tukey_c=2.5,
+            max_iter=6,
+        )
+        jerk_valid = {}
+        if medium_jerk is not None:
+            jerk_valid["medium"] = medium_jerk
+        if valid.get("long") is not None:
+            jerk_valid["long"] = valid["long"]
+        self._edge_jerk_witness_scales = jerk_valid
+
+        # Dataclass consensuses feed recovery hints. Rate/curvature use the
+        # existing production windows; jerk uses the two cubic windows above.
+        self._edge_derivative_consensus = {}
+        for attr, sigma_attr in (
+            ("rate", "rate_sigma"),
+            ("curvature", "curvature_sigma"),
+        ):
+            consensus = combine_multiscale_derivative(valid, attr, sigma_attr)
+            if consensus is not None:
+                self._edge_derivative_consensus[attr] = consensus
+
+        jerk_consensus = combine_multiscale_derivative(
+            jerk_valid, "jerk", "jerk_sigma"
+        )
+        if jerk_consensus is not None:
+            self._edge_derivative_consensus["jerk"] = jerk_consensus
+
+        # Keep the legacy dict diagnostics used by _build_attrs().
+        def _consensus(attr, sigma_attr, source=None):
+            vals = []
+            source = valid if source is None else source
+            for name in ("short", "medium", "long"):
+                est = source.get(name)
+                if est is None:
+                    continue
+                value = getattr(est, attr)
+                sigma = getattr(est, sigma_attr)
+                if value is None or sigma is None:
+                    continue
+                value = float(value)
+                sigma = float(sigma)
+                if not (math.isfinite(value) and math.isfinite(sigma) and sigma > 0.0):
+                    continue
+                vals.append((name, value, sigma))
+
+            if not vals:
+                return None
+
+            precisions = np.asarray([1.0 / (sig * sig) for _, _, sig in vals], dtype=float)
+            values = np.asarray([value for _, value, _ in vals], dtype=float)
+            psum = float(np.sum(precisions))
+            center = float(np.sum(precisions * values) / psum)
+            fit_sigma = max(math.sqrt(1.0 / psum), min(sig for _, _, sig in vals))
+
+            if len(vals) >= 2:
+                spread_var = float(np.sum(precisions * (values - center) ** 2) / psum)
+                scale_sigma = math.sqrt(max(spread_var, 0.0))
+                disagreement_z = max(
+                    abs(value - center) / math.sqrt(sig * sig + fit_sigma * fit_sigma)
+                    for _, value, sig in vals
+                )
+            else:
+                scale_sigma = 0.0
+                disagreement_z = 0.0
+
+            total_sigma = math.sqrt(fit_sigma * fit_sigma + scale_sigma * scale_sigma)
+            return {
+                "value": center,
+                "sigma": total_sigma,
+                "fit_sigma": fit_sigma,
+                "scale_sigma": scale_sigma,
+                "disagreement_z": float(disagreement_z),
+                "consistent": bool(len(vals) >= 2 and disagreement_z <= 2.0),
+                "available": len(vals),
+                "used": [name for name, _, _ in vals],
+            }
+
+        self._edge_rate_consensus = _consensus("rate", "rate_sigma")
+        self._edge_curvature_consensus = _consensus("curvature", "curvature_sigma")
+        self._edge_jerk_consensus = _consensus(
+            "jerk", "jerk_sigma", source=jerk_valid
+        )
 
     def _append_level_snapshot(self, now):
         snap = self._current_fused_snapshot(now)
@@ -1747,6 +2868,7 @@ class BayesianEnsembleSensor(SensorEntity):
             "characteristic": self._characteristic.dump() if self._characteristic is not None else None,
             "level_grid_step": self._level_grid_step,
             "level_history": [list(p) for p in self._level_history],
+            "edge_history": [list(p) for p in self._edge_history],
             "last_characteristic_fit_ts": self._last_characteristic_fit_ts,
             "last_bias_history_refit_ts": self._last_bias_history_refit_ts,
             "last_warmup_fit_ts": self._last_warmup_fit_ts,
@@ -1802,6 +2924,28 @@ class BayesianEnsembleSensor(SensorEntity):
                 if len(row) >= 3:
                     level_history.append((float(row[0]), float(row[1]), float(row[2])))
             self._level_history = deque(level_history[-self._level_history_max_points:], maxlen=self._level_history_max_points)
+
+            edge_history = []
+            for row in saved.get("edge_history", []) or []:
+                try:
+                    if len(row) >= 3:
+                        t_edge = float(row[0])
+                        z_edge = float(row[1])
+                        v_edge = float(row[2])
+                        if (
+                            math.isfinite(t_edge)
+                            and math.isfinite(z_edge)
+                            and math.isfinite(v_edge)
+                            and v_edge > 0.0
+                        ):
+                            edge_history.append(
+                                (t_edge, z_edge, max(v_edge, NUMERIC_VARIANCE_FLOOR))
+                            )
+                except Exception:
+                    continue
+            self._edge_history.clear()
+            self._edge_history.extend(edge_history[-(self._edge_history.maxlen or 4096):])
+
             self._last_characteristic_fit_ts = float(saved.get("last_characteristic_fit_ts", 0.0) or 0.0)
             self._last_bias_history_refit_ts = float(saved.get("last_bias_history_refit_ts", 0.0) or 0.0)
             self._last_warmup_fit_ts = float(saved.get("last_warmup_fit_ts", 0.0) or 0.0)
@@ -1861,6 +3005,32 @@ class BayesianEnsembleSensor(SensorEntity):
                 continue
         if rows:
             self._level_history = deque(rows[-self._level_history_max_points:], maxlen=self._level_history_max_points)
+
+        edge_rows = []
+        for row in saved.get("edge_history", []) or []:
+            try:
+                if len(row) >= 3:
+                    t_edge = float(row[0])
+                    z_edge = float(row[1])
+                    v_edge = float(row[2])
+                    if (
+                        math.isfinite(t_edge)
+                        and math.isfinite(z_edge)
+                        and math.isfinite(v_edge)
+                        and v_edge > 0.0
+                    ):
+                        edge_rows.append(
+                            (t_edge, z_edge, max(v_edge, NUMERIC_VARIANCE_FLOOR))
+                        )
+            except Exception:
+                continue
+        if edge_rows:
+            self._edge_history.clear()
+            self._edge_history.extend(edge_rows[-(self._edge_history.maxlen or 4096):])
+            self._recompute_edge_witness()
+            if self.filter.t_last is not None:
+                self._update_edge_agreement_weights()
+
         self._last_processed_by_source = {
             str(k): float(v) for k, v in (saved.get("last_processed_by_source", {}) or {}).items()
         }
@@ -2098,8 +3268,248 @@ class BayesianEnsembleSensor(SensorEntity):
                 "rate_mean_over_sigma": _round_ratio(_mean(1), rate_scale),
                 "curvature_mean_over_sigma": _round_ratio(_mean(2), curvature_scale),
                 "jerk_mean_over_sigma": _round_ratio(_mean(3), jerk_scale),
+                "rate_edge_z": (
+                    round(float(self._edge_agreement_z[1]), 4)
+                    if self._edge_agreement_z.get(1) is not None else None
+                ),
+                "curvature_edge_z": (
+                    round(float(self._edge_agreement_z[2]), 4)
+                    if self._edge_agreement_z.get(2) is not None else None
+                ),
+                "rate_edge_local_weight": (
+                    round(float(self._edge_agreement_local_weight[1]), 6)
+                    if self._edge_agreement_local_weight.get(1) is not None else None
+                ),
+                "curvature_edge_local_weight": (
+                    round(float(self._edge_agreement_local_weight[2]), 6)
+                    if self._edge_agreement_local_weight.get(2) is not None else None
+                ),
+                "jerk_edge_z": (
+                    round(float(self._edge_agreement_z[3]), 4)
+                    if self._edge_agreement_z.get(3) is not None else None
+                ),
+                "jerk_edge_local_weight": (
+                    round(float(self._edge_agreement_local_weight[3]), 6)
+                    if self._edge_agreement_local_weight.get(3) is not None else None
+                ),
             },
         }
+
+        if self._last_derivative_recondition is not None:
+            rr = self._last_derivative_recondition
+            recovery_diag = {
+                "count": int(self._derivative_recondition_count),
+                "last_from": rr.get("from_name"),
+                "last_reason": rr.get("reason"),
+                "last_trigger_z": (
+                    round(float(rr.get("trigger_z")), 4)
+                    if math.isfinite(float(rr.get("trigger_z", float("nan")))) else None
+                ),
+                "last_candidate_elapsed_s": (
+                    round(float(rr.get("candidate_elapsed_s")), 3)
+                    if rr.get("candidate_elapsed_s") is not None else None
+                ),
+                "last_confirm_duration_s": (
+                    round(float(rr.get("confirm_duration_s")), 3)
+                    if rr.get("confirm_duration_s") is not None else None
+                ),
+                "enter_sigma": float(self._derivative_recovery_enter_sigma),
+                "cancel_sigma": float(self._derivative_recovery_cancel_sigma),
+                "confirm_updates": int(self._derivative_recovery_confirm_updates),
+                "timescale_factor": float(self._derivative_recovery_timescale_factor),
+                "process_timescale_s": (
+                    round(float(self._gated_dynamics.timescale_s), 3)
+                    if self._gated_dynamics is not None
+                    and math.isfinite(float(self._gated_dynamics.timescale_s))
+                    else None
+                ),
+                "bad_update_counts": {
+                    {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k)): int(v)
+                    for k, v in sorted(self._fallback_derivative_weight_counts.items())
+                    if int(k) < self.filter.state_model.dim_x()
+                },
+                "bad_duration_s": {
+                    {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k)): (
+                        round(max(
+                            0.0,
+                            float(self.filter.t_last or 0.0) - float(v)
+                        ), 3)
+                        if v is not None else 0.0
+                    )
+                    for k, v in sorted(self._derivative_recovery_bad_since.items())
+                    if int(k) < self.filter.state_model.dim_x()
+                },
+            }
+            applied_hints = dict(rr.get("applied_hints", {}) or {})
+            recovery_diag["hinted_orders"] = [
+                {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k))
+                for k in sorted(applied_hints, key=lambda x: int(x))
+            ]
+            recovery_diag["edge_divergence"] = {
+                "enter_sigma": float(self._edge_divergence_sigma),
+                "cancel_sigma": float(self._edge_divergence_cancel_sigma),
+                "confirm_updates": int(self._edge_divergence_confirm_updates),
+                "counts": {
+                    {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k)): int(v)
+                    for k, v in sorted(self._edge_divergence_counts.items())
+                },
+                "z": {
+                    {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k)): round(float(v), 4)
+                    for k, v in sorted(self._edge_last_divergence_z.items())
+                },
+                "last_edge_update_age_s": (
+                    round(
+                        max(
+                            0.0,
+                            float(self.filter.t_last or 0.0) - float(self._edge_last_update_ts)
+                        ),
+                        3,
+                    )
+                    if self._edge_last_update_ts is not None
+                    else None
+                ),
+            }
+            if self._diagnostics_mode == "debug":
+                recovery_diag.update({
+                    "last_timestamp": rr.get("timestamp"),
+                    "old_derivatives": rr.get("old_derivatives"),
+                    "restored_sigmas": rr.get("restored_sigmas"),
+                    "applied_hints": applied_hints,
+                })
+            dynamics["recovery"] = recovery_diag
+
+        else:
+            # Expose watchdog state even before the first recovery.  This is
+            # diagnostic-only and lets us distinguish "no valid edge hints"
+            # from "waiting for 3 witness confirmations".
+            dynamics["recovery"] = {
+                "count": int(self._derivative_recondition_count),
+                "enter_sigma": float(self._derivative_recovery_enter_sigma),
+                "cancel_sigma": float(self._derivative_recovery_cancel_sigma),
+                "confirm_updates": int(self._derivative_recovery_confirm_updates),
+                "timescale_factor": float(self._derivative_recovery_timescale_factor),
+                "process_timescale_s": (
+                    round(float(self._gated_dynamics.timescale_s), 3)
+                    if self._gated_dynamics is not None
+                    and math.isfinite(float(self._gated_dynamics.timescale_s))
+                    else None
+                ),
+                "edge_divergence": {
+                    "enter_sigma": float(self._edge_divergence_sigma),
+                "cancel_sigma": float(self._edge_divergence_cancel_sigma),
+                    "confirm_updates": int(self._edge_divergence_confirm_updates),
+                    "counts": {
+                        {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k)): int(v)
+                        for k, v in sorted(self._edge_divergence_counts.items())
+                    },
+                    "z": {
+                        {1: "rate", 2: "curvature", 3: "jerk"}.get(int(k), str(k)): round(float(v), 4)
+                        for k, v in sorted(self._edge_last_divergence_z.items())
+                    },
+                    "last_edge_update_age_s": (
+                        round(
+                            max(
+                                0.0,
+                                float(self.filter.t_last or 0.0) - float(self._edge_last_update_ts)
+                            ),
+                            3,
+                        )
+                        if self._edge_last_update_ts is not None
+                        else None
+                    ),
+                },
+            }
+
+        edge = self._edge_derivative_estimate
+        rate_consensus = self._edge_derivative_consensus.get("rate")
+        curvature_consensus = self._edge_derivative_consensus.get("curvature")
+        jerk_consensus = self._edge_derivative_consensus.get("jerk")
+        if edge is not None and rate_consensus is not None:
+            rate_consensus = self._edge_rate_consensus
+            curvature_consensus = self._edge_curvature_consensus
+            jerk_consensus = self._edge_jerk_consensus
+            scale_spans = {}
+            for name, est in (self._edge_witness_scales or {}).items():
+                scale_spans[name] = {
+                    "points": int(est.points),
+                    "span_s": round(float(est.span_s), 3),
+                }
+
+            edge_diag = {
+                "method": "robust_multiscale_causal_local_polynomial",
+                "bandwidth_source": "point_count_and_process_timescale",
+                "windows_points": [25, 40, 55],
+                "windows_tau_factors": [0.5, 1.0, 2.0],
+                "process_timescale_s": (
+                    round(float(self._edge_witness_tau_s), 3)
+                    if self._edge_witness_tau_s is not None else None
+                ),
+                "gap_limit_s": round(float(self._edge_process_timescale_s()), 3),
+                "segment_points": int(len(self._edge_history)),
+                "segment_span_s": (
+                    round(
+                        float(self._edge_history[-1][0])
+                        - float(self._edge_history[0][0]),
+                        3,
+                    )
+                    if len(self._edge_history) >= 2 else 0.0
+                ),
+                "windows": scale_spans,
+            }
+
+            if rate_consensus is not None:
+                edge_diag.update({
+                    "rate_per_hour": round(float(rate_consensus["value"]) * 3600.0, 10),
+                    "rate_sigma_per_hour": round(float(rate_consensus["sigma"]) * 3600.0, 10),
+                    "rate_fit_sigma_per_hour": round(float(rate_consensus["fit_sigma"]) * 3600.0, 10),
+                    "rate_scale_sigma_per_hour": round(float(rate_consensus["scale_sigma"]) * 3600.0, 10),
+                    "scale_disagreement_z": round(float(rate_consensus["disagreement_z"]), 4),
+                    "scale_consistent": bool(rate_consensus["consistent"]),
+                    "available_windows": int(rate_consensus["available"]),
+                    "windows_used": list(rate_consensus["used"]),
+                })
+
+            if curvature_consensus is not None:
+                edge_diag.update({
+                    "curvature_per_hour2": round(
+                        float(curvature_consensus["value"]) * (3600.0 ** 2), 10
+                    ),
+                    "curvature_sigma_per_hour2": round(
+                        float(curvature_consensus["sigma"]) * (3600.0 ** 2), 10
+                    ),
+                    "curvature_fit_sigma_per_hour2": round(
+                        float(curvature_consensus["fit_sigma"]) * (3600.0 ** 2), 10
+                    ),
+                    "curvature_scale_sigma_per_hour2": round(
+                        float(curvature_consensus["scale_sigma"]) * (3600.0 ** 2), 10
+                    ),
+                    "curvature_scale_disagreement_z": round(
+                        float(curvature_consensus["disagreement_z"]), 4
+                    ),
+                })
+
+            if jerk_consensus is not None:
+                edge_diag.update({
+                    "jerk_per_hour3": round(
+                        float(jerk_consensus["value"]) * (3600.0 ** 3), 10
+                    ),
+                    "jerk_sigma_per_hour3": round(
+                        float(jerk_consensus["sigma"]) * (3600.0 ** 3), 10
+                    ),
+                    "jerk_fit_sigma_per_hour3": round(
+                        float(jerk_consensus["fit_sigma"]) * (3600.0 ** 3), 10
+                    ),
+                    "jerk_scale_sigma_per_hour3": round(
+                        float(jerk_consensus["scale_sigma"]) * (3600.0 ** 3), 10
+                    ),
+                    "jerk_scale_disagreement_z": round(
+                        float(jerk_consensus["disagreement_z"]), 4
+                    ),
+                    "jerk_available_windows": int(jerk_consensus["available"]),
+                    "jerk_windows_used": list(jerk_consensus["used"]),
+                })
+
+            dynamics["edge_witness"] = edge_diag
 
         # Compact operational source summary.  Detailed per-source calibration
         # lives only in debug mode.

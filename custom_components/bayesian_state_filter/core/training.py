@@ -67,12 +67,31 @@ class SourceCalibration:
     def outlier_rate(self):
         return float(self.outliers) / max(int(self.updates), 1)
 
-    def variance(self, value: float, noise_mode: str = "gaussian") -> float:
+    def variance(self, value: float, noise_mode: str = "gaussian",
+                 level_fraction: float | None = None) -> float:
+        """Return observation variance at ``value``.
+
+        ``sigma`` remains the empirically calibrated measurement-noise scale at
+        the source's typical level.  ``level_fraction`` changes only the shape
+        of R(x):
+
+            R(x) = sigma^2 * ((1-p) + p * |x| / x_ref)
+
+        p=0 is constant additive variance, p=1 is the scaled-count limit, and
+        intermediate values represent mixed observation noise.  Keeping the
+        calibration anchored at x_ref avoids reinterpreting the learned sigma.
+        """
         s2 = max(self.sigma * self.sigma, 1e-12)
-        if noise_mode == "poisson":
-            k = s2 / max(self.typical_abs_level, 1e-9)
-            return max(k * max(abs(float(value)), 1e-9), 1e-12)
-        return s2
+        if level_fraction is None:
+            p = 1.0 if noise_mode == "poisson" else 0.0
+        else:
+            p = max(0.0, min(1.0, float(level_fraction)))
+        if p <= 0.0:
+            return s2
+        x_ref = max(self.typical_abs_level, 1e-9)
+        ratio = max(abs(float(value)), 1e-9) / x_ref
+        shape = (1.0 - p) + p * ratio
+        return max(s2 * shape, 1e-12)
 
     def dump(self):
         return asdict(self)

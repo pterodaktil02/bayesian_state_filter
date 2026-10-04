@@ -42,9 +42,12 @@ class StudentTUpdater:
     the upper side to 1.0.
     """
 
-    def __init__(self, nu: float = 4.0, min_weight: float = 0.05):
+    def __init__(self, nu: float = 4.0, min_weight: float = 0.05, clip_sigma: float | None = None):
         self.nu = max(float(nu), 1.01)
         self.min_weight = max(min(float(min_weight), 1.0), 1e-6)
+        self.clip_sigma = (
+            None if clip_sigma is None else max(float(clip_sigma), 0.5)
+        )
 
     def update(self, x_pred, P_pred, obs, dt, state_model):
         H = state_model.jacobian(x_pred)
@@ -60,7 +63,21 @@ class StudentTUpdater:
         S_eff = float((H @ P_pred @ H.T)[0, 0] + R_eff)
         S_eff = max(S_eff, NUMERIC_VARIANCE_FLOOR)
         K = (P_pred @ H.T) / S_eff
-        x_post = x_pred + (K[:, 0] * innovation)
+
+        # Optional hard innovation winsorisation is deliberately applied only
+        # to the state correction.  Diagnostics and change-point detection keep
+        # the raw innovation, so a persistent physical regime change is still
+        # visible while an isolated startup/glitch excursion cannot drag the
+        # latent state arbitrarily far in one update.
+        innovation_used = innovation
+        clip_applied = False
+        if self.clip_sigma is not None:
+            limit = self.clip_sigma * math.sqrt(S)
+            if abs(innovation_used) > limit:
+                innovation_used = math.copysign(limit, innovation_used)
+                clip_applied = True
+
+        x_post = x_pred + (K[:, 0] * innovation_used)
         I = np.eye(P_pred.shape[0], dtype=float)
         KH = K @ H
         P_post = (I - KH) @ P_pred @ (I - KH).T + K * R_eff @ K.T
@@ -76,5 +93,8 @@ class StudentTUpdater:
             "measurement_var": R,
             "effective_innovation_var": S_eff,
             "weight": weight,
+            "innovation_used": float(innovation_used),
+            "innovation_clipped": bool(clip_applied),
+            "clip_sigma": self.clip_sigma,
             "loglik": loglik,
         }

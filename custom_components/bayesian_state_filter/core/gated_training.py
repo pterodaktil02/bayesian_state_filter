@@ -239,37 +239,48 @@ def _historical_regime_boundaries(points, *, z_threshold: float = REGIME_CHANGE_
     return boundaries, {"detected_level_jumps": int(len(boundaries))}
 
 
-def _estimate_derivative_profile(points, *, max_fits: int = 8000, half_window: int = 4,
+def _estimate_derivative_profile(points, *, timescale_s: float, max_samples: int = 8000,
                                  regime_z_threshold: float = REGIME_CHANGE_Z_THRESHOLD,
                                  regime_confirmations: int = REGIME_CHANGE_CONFIRMATIONS,
                                  regime_compact_sigma: float = REGIME_CHANGE_COMPACT_SIGMA):
-    """Estimate robust v/a/j scales from smooth parts of the training trajectory.
+    """Estimate characteristic v/a/j scales at the Bayesian dynamics timescale.
 
-    A centred local cubic is fitted directly to the fused history using the
-    basis [1, dt, dt^2/2, dt^3/6], so the fitted coefficients are level,
-    velocity, acceleration and jerk in native SI time units.  Windows crossing
-    a confirmed historical level-regime transition are excluded: a physical
-    step must not inflate the derivative distribution.
+    The old implementation fitted a cubic through nine neighbouring samples.
+    For slowly sampled or noisy sources that mostly measured amplified
+    high-frequency measurement structure, not the dynamics that the Bayesian
+    model actually transports.
 
-    The published centre is the sample median; the arithmetic mean is retained
-    as a diagnostic so we can verify that, after removing phase transitions,
-    derivative expectation collapses towards zero.  The production gate itself
-    remains centred at zero and uses the larger of ordinary MAD around the
-    median and a zero-centred robust scale 1.4826*median(|d|).
+    Here derivatives are finite differences on one common physical horizon
+    ``T = timescale_s``:
+
+      v = (x0 - x1) / T
+      a = (x0 - 2*x1 + x2) / T**2
+      j = (x0 - 3*x1 + 3*x2 - x3) / T**3
+
+    where xk is the linearly interpolated level at t-k*T.  Samples never cross
+    confirmed regime changes or large recorder gaps.  The production
+    plausibility scale is zero-centred robust sigma
+    ``1.4826 * median(abs(d))``.  Signed median and arithmetic mean are kept
+    only as diagnostics.
     """
     n = len(points)
     centers = [0.0] * (_FULL_ORDER + 1)
     means = [0.0] * (_FULL_ORDER + 1)
     scales = [float("nan")] * (_FULL_ORDER + 1)
     samples = [0] * (_FULL_ORDER + 1)
+    T = float(timescale_s)
     diagnostics = {
-        "candidate_windows": 0,
-        "accepted_windows": 0,
-        "rejected_gap_windows": 0,
-        "rejected_regime_crossing_windows": 0,
+        "method": "finite_difference_at_gated_timescale",
+        "timescale_s": T,
+        "candidate_samples": 0,
+        "accepted_samples": 0,
+        "rejected_short_segment_samples": 0,
+        "rejected_regime_crossing_samples": 0,
+        "rejected_gap_samples": 0,
         "detected_level_jumps": 0,
+        "median_abs": [None] * (_FULL_ORDER + 1),
     }
-    if n < 2 * half_window + 1:
+    if n < 4 or not math.isfinite(T) or T <= 0.0:
         return centers, scales, samples, means, diagnostics
 
     dt0 = max(_median_dt(points), 1e-9)
@@ -281,47 +292,69 @@ def _estimate_derivative_profile(points, *, max_fits: int = 8000, half_window: i
     )
     diagnostics.update(regime_diag)
 
-    valid = np.arange(half_window, n - half_window, dtype=int)
-    if valid.size > max_fits:
-        pick = np.linspace(0, valid.size - 1, max_fits, dtype=int)
-        valid = valid[pick]
+    # Build independent continuous segments.  A confirmed regime boundary or a
+    # large Recorder gap starts a new segment, so interpolation can never bridge
+    # a step or missing-data interval.
+    split_before = set(int(b) for b in boundaries if 0 < int(b) < n)
+    for i in range(1, n):
+        dt = float(points[i][0]) - float(points[i - 1][0])
+        if not math.isfinite(dt) or dt <= 0.0 or dt > 4.0 * dt0:
+            split_before.add(i)
+            diagnostics["rejected_gap_samples"] += 1
 
+    cuts = [0] + sorted(split_before) + [n]
     collected = [[] for _ in range(_FULL_ORDER + 1)]
-    for i in valid:
-        diagnostics["candidate_windows"] += 1
-        lo = int(i - half_window)
-        hi = int(i + half_window)
-        # A boundary b means sample b is the first point of the new regime.
-        # Reject whenever the local polynomial sees points on both sides.
-        if any(lo < b <= hi for b in boundaries):
-            diagnostics["rejected_regime_crossing_windows"] += 1
+
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        segment = points[a:b]
+        if len(segment) < 2:
+            continue
+        tt = np.asarray([float(p[0]) for p in segment], dtype=float)
+        zz = np.asarray([float(p[1]) for p in segment], dtype=float)
+        good = np.isfinite(tt) & np.isfinite(zz)
+        tt = tt[good]
+        zz = zz[good]
+        if tt.size < 2:
             continue
 
-        window = points[lo:hi + 1]
-        tt = np.asarray([float(p[0]) for p in window], dtype=float)
-        zz = np.asarray([float(p[1]) for p in window], dtype=float)
-        if not np.all(np.isfinite(tt)) or not np.all(np.isfinite(zz)):
-            continue
-        gaps = np.diff(tt)
-        if gaps.size and (np.any(gaps <= 0.0) or np.max(gaps) > 4.0 * dt0):
-            diagnostics["rejected_gap_windows"] += 1
-            continue
-        u = tt - float(points[i][0])
-        A = np.column_stack((
-            np.ones_like(u),
-            u,
-            0.5 * u * u,
-            (u * u * u) / 6.0,
-        ))
-        try:
-            beta, *_ = np.linalg.lstsq(A, zz, rcond=None)
-        except np.linalg.LinAlgError:
-            continue
-        if beta.size != _FULL_ORDER + 1 or not np.all(np.isfinite(beta)):
-            continue
-        diagnostics["accepted_windows"] += 1
-        for order in range(1, _FULL_ORDER + 1):
-            collected[order].append(float(beta[order]))
+        # Need 3*T of clean history to estimate jerk.  Rate and acceleration
+        # begin contributing as soon as their own horizons are available.
+        idx = np.arange(tt.size, dtype=int)
+        if idx.size > max_samples:
+            pick = np.linspace(0, idx.size - 1, max_samples, dtype=int)
+            idx = np.unique(pick)
+
+        t0_seg = float(tt[0])
+        for i in idx:
+            t = float(tt[i])
+            diagnostics["candidate_samples"] += 1
+            x0 = float(zz[i])
+            accepted_here = False
+
+            # Linear interpolation is intentional: unlike a local polynomial it
+            # does not manufacture higher-order structure between samples.
+            if t - T >= t0_seg:
+                x1 = float(np.interp(t - T, tt, zz))
+                collected[1].append((x0 - x1) / T)
+                accepted_here = True
+            else:
+                diagnostics["rejected_short_segment_samples"] += 1
+
+            if t - 2.0 * T >= t0_seg:
+                x1 = float(np.interp(t - T, tt, zz))
+                x2 = float(np.interp(t - 2.0 * T, tt, zz))
+                collected[2].append((x0 - 2.0 * x1 + x2) / (T * T))
+                accepted_here = True
+
+            if t - 3.0 * T >= t0_seg:
+                x1 = float(np.interp(t - T, tt, zz))
+                x2 = float(np.interp(t - 2.0 * T, tt, zz))
+                x3 = float(np.interp(t - 3.0 * T, tt, zz))
+                collected[3].append((x0 - 3.0 * x1 + 3.0 * x2 - x3) / (T ** 3))
+                accepted_here = True
+
+            if accepted_here:
+                diagnostics["accepted_samples"] += 1
 
     for order in range(1, _FULL_ORDER + 1):
         arr = np.asarray(collected[order], dtype=float)
@@ -330,16 +363,15 @@ def _estimate_derivative_profile(points, *, max_fits: int = 8000, half_window: i
             continue
         center = float(np.median(arr))
         mean = float(np.mean(arr))
-        sigma_mad = 1.4826 * float(np.median(np.abs(arr - center)))
-        sigma_zero = 1.4826 * float(np.median(np.abs(arr)))
-        scale = max(sigma_mad, sigma_zero, 0.0)
+        median_abs = float(np.median(np.abs(arr)))
+        scale = 1.4826 * median_abs
         centers[order] = center
         means[order] = mean
-        scales[order] = scale
+        scales[order] = max(scale, 0.0)
         samples[order] = int(arr.size)
+        diagnostics["median_abs"][order] = median_abs
 
     return centers, scales, samples, means, diagnostics
-
 
 def _student_score(err: float, variance: float, nu: float) -> float:
     """Robust proper-ish predictive score; lower is better."""
@@ -508,11 +540,21 @@ def train_gated_dynamics(fused_points, nu: float = 4.0, train_fraction: float = 
     train = points[:split]
     validation = points[split:]
 
-    derivative_profile_full = _estimate_derivative_profile(points)
-    derivative_profile = derivative_profile_full[:3]
-    q, level_q, Tdiag, train_score, boundary, rounds = fit_process_noise(
-        train, nu, derivative_profile=derivative_profile
+    # First identify a coarse dynamics timescale without a derivative prior.
+    # Then learn derivative plausibility on that same physical horizon and
+    # refit Q once.  Finally recompute the published derivative profile at the
+    # final fitted timescale so diagnostics and reset variances describe exactly
+    # the scale transported by the Bayesian model.
+    q0, level_q0, T0, _score0, _boundary0, _rounds0 = fit_process_noise(
+        train, nu, derivative_profile=None
     )
+    derivative_profile_seed_full = _estimate_derivative_profile(points, timescale_s=T0)
+    derivative_profile_seed = derivative_profile_seed_full[:3]
+    q, level_q, Tdiag, train_score, boundary, rounds = fit_process_noise(
+        train, nu, derivative_profile=derivative_profile_seed
+    )
+    derivative_profile_full = _estimate_derivative_profile(points, timescale_s=Tdiag)
+    derivative_profile = derivative_profile_full[:3]
     dt = max(_median_dt(train), 1e-6)
     prior_T = max(16.0 * dt, 60.0)
     val_points = _representative_points(validation, max_points=6000, blocks=6)

@@ -44,17 +44,17 @@ class PolynomialStateModel:
 
 
 class AdaptivePolynomialStateModel(PolynomialStateModel):
-    """Full [x, v, a, j] state with history-trained plausibility gating.
+    """Full [x, v, a, j] state with witness-aware derivative coupling.
 
     Derivative *confidence* and derivative *plausibility* are intentionally
     different quantities:
 
     - ``confidence_weights`` reports posterior significance
       ``erf(|d| / sigma_posterior / sqrt(2))`` for diagnostics only;
-    - ``effective_weights`` controls kinematic transport/prediction. Local
-      derivative plausibility falls as magnitude becomes unusual relative to
-      the robust history scale, while effective higher-order weights inherit
-      every lower-order penalty.
+    - ``effective_weights`` controls kinematic transport/prediction. When an
+      independent causal witness is available, v/a/j use its agreement
+      weight; otherwise they fall back to history-trained plausibility. Higher
+      orders inherit every lower-order penalty.
 
     For derivative order k the production gate is
 
@@ -74,6 +74,12 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         self._derivative_centers = np.zeros(self.dim_x(), dtype=float)
         self._derivative_scales = np.full(self.dim_x(), np.nan, dtype=float)
         self._derivative_samples = np.zeros(self.dim_x(), dtype=int)
+        # Optional local derivative weights supplied by an independent causal
+        # witness. NaN means "no valid witness": fall back to historical
+        # plausibility for that derivative order.
+        self._external_derivative_weights = np.full(
+            self.dim_x(), np.nan, dtype=float
+        )
 
     def set_derivative_plausibility(self, scales=None, centers=None, samples=None):
         """Install history-trained robust derivative scales.
@@ -110,6 +116,30 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         self._derivative_scales = out_scales
         self._derivative_centers = out_centers
         self._derivative_samples = out_samples
+
+    def set_external_derivative_weights(self, weights=None):
+        """Install local witness-agreement weights for derivative coupling.
+
+        ``weights`` is a mapping ``order -> weight``. Missing orders are
+        cleared to NaN and therefore use the historical plausibility fallback.
+        """
+        out = np.full(self.dim_x(), np.nan, dtype=float)
+        for key, value in dict(weights or {}).items():
+            try:
+                order = int(key)
+                weight = float(value)
+            except (TypeError, ValueError):
+                continue
+            if (
+                0 < order < self.dim_x()
+                and math.isfinite(weight)
+                and 0.0 <= weight <= 1.0
+            ):
+                out[order] = weight
+        self._external_derivative_weights = out
+
+    def external_derivative_weights(self):
+        return self._external_derivative_weights.copy()
 
     def derivative_plausibility_parameters(self):
         return {
@@ -163,6 +193,27 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
             return 1.0
         return self.plausibility_weight(x[order], order)
 
+    def first_rejected_derivative(self, x):
+        """Return the first derivative rejected by the historical plausibility prior.
+
+        The result is ``(order, z_hist, sigma_hist)``.  Because the dynamic
+        state is hierarchical, rejection of order k invalidates k and every
+        higher derivative as a coherent kinematic chain.
+        """
+        for order in range(1, self.dim_x()):
+            scale = float(self._derivative_scales[order])
+            if not math.isfinite(scale):
+                continue
+            value = abs(float(x[order]))
+            if scale <= 0.0:
+                if value > 1e-15:
+                    return order, float("inf"), scale
+                continue
+            z = value / scale
+            if (not math.isfinite(z)) or z >= self.PLAUSIBILITY_CUTOFF_SIGMA:
+                return order, float(z), scale
+        return None
+
     def confidence_weights(self, x, P):
         """Independent posterior significance for each derivative order."""
         c = np.ones(self.dim_x(), dtype=float)
@@ -171,25 +222,28 @@ class AdaptivePolynomialStateModel(PolynomialStateModel):
         return c
 
     def effective_weights(self, x, P, dt: float):
-        """Hierarchical history-plausibility weights for v/a/j coupling.
+        """Hierarchical derivative-coupling weights for v/a/j.
 
-        Each derivative has its own Gaussian plausibility gate, but higher
-        orders inherit every lower-order penalty:
+        For orders backed by a valid independent edge witness, the local weight
+        is the Bayes<->edge agreement weight supplied by the coordinator.
+        Otherwise the historical plausibility weight is used as a fallback.
+        Higher orders still inherit every lower-order penalty:
 
             W_v = w_v
             W_a = w_v * w_a
             W_j = w_v * w_a * w_j
 
-        This makes the state model degrade monotonically toward a lower-order
-        model as its dynamics become implausible: x-v-a-j -> x-v-a -> x-v -> x.
-        Small derivatives are not suppressed: d=0 has local weight 1.  Any
-        local five-sigma rejection also disables all higher derivatives.
+        Any derivative order with a valid external witness uses that local
+        agreement weight; historical plausibility remains the fallback.
         """
         w = np.ones(self.dim_x(), dtype=float)
         cumulative = 1.0
+        external = self._external_derivative_weights
         for order in range(1, self.dim_x()):
-            local = self.plausibility_weight(x[order], order)
-            cumulative *= local
+            local = float(external[order])
+            if not math.isfinite(local):
+                local = self.plausibility_weight(x[order], order)
+            cumulative *= min(1.0, max(0.0, local))
             w[order] = cumulative
         return w
 
